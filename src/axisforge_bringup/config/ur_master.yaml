@@ -12,7 +12,7 @@ gcode_interpreter:
     bed_probe_extrapolation_mm: 5.0  # Allowed XY distance beyond the probed points
     wrist_angle: 90.0
     nozzle_roll_deg: 180.0
-    nozzle_pitch_deg: 0.0            # Initial pitch; G-code A overrides it in degrees. Probe at 0 deg.
+    nozzle_pitch_deg: 0.0            # Home pitch; G-code B (degrees about Y) is added to it. Probe at 0 deg.
     tcp_offset_mm: [-100.00, 0.00, 117.06] #119.15
     # tcp_offset_mm: [-65.73, 3.56, 99.38]
 

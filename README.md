@@ -159,7 +159,7 @@ Configuration is in [`ur_master.yaml`](src/axisforge_bringup/config/ur_master.ya
 | --- | --- |
 | `x_offset`, `y_offset`, `z_offset`, `origin_at_center`, `bed_size_mm` | Preserve the old placement convention; center mode adds half the bed dimensions to X/Y offsets |
 | `bed_probe_file`, `bed_z_adjust_mm`, `bed_probe_extrapolation_mm` | Probed bed surface (relative to the launch directory; `''` uses the flat `z_offset`), first-layer fine adjust (+ raises the nozzle), and the allowed XY distance beyond the probed points |
-| `nozzle_roll_deg`, `nozzle_pitch_deg`, `wrist_angle` | Initial tool orientation in degrees; G-code A overrides pitch, and `wrist_angle` remains yaw. Bed probing always uses roll 180°, pitch 0° |
+| `nozzle_roll_deg`, `nozzle_pitch_deg`, `wrist_angle` | Home tool orientation in degrees (`wrist_angle` is yaw). G-code `A`, `B`, `C` are absolute rotations in degrees about X, Y and Z, added to roll, pitch and yaw respectively (default 0). Bed probing always uses roll 180°, pitch 0° |
 | `tcp_offset_mm` | Nozzle-tip offset in tool0 coordinates; zero preserves old tool0 targets. With a measured TCP, the XYZ offsets must refer to the nozzle tip |
 | `waypoint_spacing_mm` | Spatial sampling interval, replacing `split_threshold` |
 | `path_tolerance_mm`, `orientation_tolerance_deg` | Model-based checks between IK samples using cubic interpolation |

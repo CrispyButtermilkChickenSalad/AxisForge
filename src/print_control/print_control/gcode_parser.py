@@ -20,14 +20,15 @@ class ToolpathSegment:
     source_line: int
     layer: int | None = None
     dwell_s: float = 0.0
-    start_pitch_deg: float | None = None
-    nozzle_pitch_deg: float | None = None
+    # (A, B, C): absolute rotations in degrees about X, Y and Z, relative to the
+    # configured home orientation.
+    start_orientation_deg: tuple = (0.0, 0.0, 0.0)
+    orientation_deg: tuple = (0.0, 0.0, 0.0)
 
     def __post_init__(self):
         """Reject overflow in resolved coordinates, feed or material increments."""
-        values = (*self.start, *self.end, self.delta_e, self.feed_mm_s, self.dwell_s)
-        values += tuple(value for value in (self.start_pitch_deg, self.nozzle_pitch_deg)
-                        if value is not None)
+        values = (*self.start, *self.end, self.delta_e, self.feed_mm_s, self.dwell_s,
+                  *self.start_orientation_deg, *self.orientation_deg)
         if not all(math.isfinite(value) for value in values) or not math.isfinite(self.length_mm):
             raise ValueError('Resolved segment contains nonfinite values')
 
@@ -56,7 +57,7 @@ class GCodeParser:
         self.speed_factor = 1.0
         self.flow_factor = 1.0
         self.layer = None
-        self.pitch = None  # None keeps the configured nozzle_pitch_deg until the first A.
+        self.orientation = (0.0, 0.0, 0.0)  # Modal A, B, C; zero is the configured home pose.
         self.pressure_advance_s = pressure_advance_s
 
     def parse(self, lines):
@@ -119,7 +120,7 @@ class GCodeParser:
         if any(value is None for value in words.values()):
             raise ValueError('Missing parameter value')
         allowed = {
-            'G0': 'XYZAEF', 'G1': 'XYZAEF', 'G4': 'PS', 'G20': '', 'G21': '',
+            'G0': 'XYZABCEF', 'G1': 'XYZABCEF', 'G4': 'PS', 'G20': '', 'G21': '',
             'G90': '', 'G91': '', 'G92': 'XYZE', 'M82': '', 'M83': '',
             'M220': 'S', 'M221': 'S', 'M400': '',
         }
@@ -127,7 +128,7 @@ class GCodeParser:
             if set(words) <= {'F'}:
                 self.set_feed(words)
                 return None
-            code = self.motion or ('G1' if 'A' in words else None)
+            code = self.motion or ('G1' if set(words) & set('ABC') else None)
         if code not in allowed:
             raise ValueError(f'Unsupported command {code or text}')
         unexpected = set(words) - set(allowed[code])
@@ -160,7 +161,7 @@ class GCodeParser:
                 raise ValueError('Dwell must not be negative')
             return ToolpathSegment(tuple(self.position), tuple(self.position), 0.0,
                                    0.0, 'dwell', number, self.layer, duration,
-                                   self.pitch, self.pitch)
+                                   self.orientation, self.orientation)
         elif code in ('G0', 'G1'):
             self.motion = code
             return self.move(words, number, code)
@@ -174,13 +175,13 @@ class GCodeParser:
             self.feed = words['F'] * self.unit / 60
 
     def move(self, words, number, code):
-        """Resolve XYZ/E and modal A; A is always an absolute nozzle pitch in degrees."""
+        """Resolve XYZ/E and modal A/B/C, absolute degrees about X/Y/Z from the home pose."""
         self.set_feed(words)
         start = tuple(self.position)
         previous_e = self.extrusion
-        previous_pitch = self.pitch
-        if 'A' in words:
-            self.pitch = words['A']
+        previous_orientation = self.orientation
+        self.orientation = tuple(words.get(axis, current)
+                                 for axis, current in zip('ABC', self.orientation))
         for index, axis in enumerate('XYZ'):
             if axis in words:
                 value = words[axis] * self.unit
@@ -191,7 +192,7 @@ class GCodeParser:
             self.extrusion = value if self.e_absolute else self.extrusion + value
         delta_e = (self.extrusion - previous_e) * self.flow_factor
         length = math.dist(start, self.position)
-        turning = self.pitch != previous_pitch
+        turning = self.orientation != previous_orientation
         if length < 1e-9 and abs(delta_e) < 1e-9 and not turning:
             return None
         feed = self.feed
@@ -204,4 +205,5 @@ class GCodeParser:
             kind = 'orientation' if turning else 'extrude'
         return ToolpathSegment(start, tuple(self.position), delta_e,
                                feed * self.speed_factor, kind, number, self.layer,
-                               start_pitch_deg=previous_pitch, nozzle_pitch_deg=self.pitch)
+                               start_orientation_deg=previous_orientation,
+                               orientation_deg=self.orientation)
