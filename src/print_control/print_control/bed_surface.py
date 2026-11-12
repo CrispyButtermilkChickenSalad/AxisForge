@@ -104,14 +104,10 @@ def subdivide(segments, max_length_mm=MAX_SEGMENT_MM):
             pieces.append(segment)
             continue
         nodes = np.linspace(segment.start, segment.end, count + 1)
-        pitches = None
-        if segment.start_pitch_deg is not None and segment.nozzle_pitch_deg is not None:
-            pitches = np.linspace(segment.start_pitch_deg, segment.nozzle_pitch_deg, count + 1)
+        angles = np.linspace(segment.start_orientation_deg, segment.orientation_deg, count + 1)
         pieces.extend(replace(segment, start=tuple(start), end=tuple(end),
                               delta_e=segment.delta_e / count,
-                              start_pitch_deg=(segment.start_pitch_deg if pitches is None
-                                               else float(pitches[index])),
-                              nozzle_pitch_deg=(segment.nozzle_pitch_deg if pitches is None
-                                                else float(pitches[index + 1])))
+                              start_orientation_deg=tuple(float(v) for v in angles[index]),
+                              orientation_deg=tuple(float(v) for v in angles[index + 1]))
                       for index, (start, end) in enumerate(zip(nodes[:-1], nodes[1:])))
     return pieces
