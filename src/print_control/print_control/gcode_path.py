@@ -122,7 +122,7 @@ class GCodePlanner(MotionPlanner):
     """Reuse nozzle IK and interpolation checks with joint and TCP constraints."""
 
     def __init__(self, settings, motion_config):
-        """Start at the configured orientation; G-code A overrides the pitch."""
+        """Start at the configured home orientation; G-code A/B/C rotate away from it."""
         settings.validate()
         self.settings = settings
         super().__init__(replace(
@@ -130,7 +130,7 @@ class GCodePlanner(MotionPlanner):
             nozzle_rpy_deg=(settings.nozzle_roll_deg, settings.nozzle_pitch_deg,
                             settings.wrist_angle),
         ))
-        self.pitch_deg = settings.nozzle_pitch_deg
+        self.orientation = (0.0, 0.0, 0.0)
         if (settings.lookahead_enabled and
                 settings.corner_blend_tolerance_mm >= self.config.path_tolerance_mm):
             raise ValueError('corner_blend_tolerance_mm must be less than path_tolerance_mm')
@@ -148,9 +148,11 @@ class GCodePlanner(MotionPlanner):
             base[2] = point[2] + self.bed.height(base) + self.settings.bed_z_adjust_mm
         return tuple(base)
 
-    def rotation_for(self, pitch_deg):
-        """Map A directly to nozzle pitch, keeping the configured roll and yaw."""
-        return SE3.RPY((self.settings.nozzle_roll_deg, pitch_deg, self.settings.wrist_angle),
+    def rotation_for(self, orientation_deg):
+        """Map A/B/C (about X/Y/Z) onto the configured roll/pitch/yaw home orientation."""
+        a, b, c = orientation_deg
+        cfg = self.settings
+        return SE3.RPY((cfg.nozzle_roll_deg + a, cfg.nozzle_pitch_deg + b, cfg.wrist_angle + c),
                        unit='deg', order='zyx').R
 
     def nozzle_jacobian(self, joints):
@@ -260,22 +262,24 @@ class GCodePlanner(MotionPlanner):
         duration_parts(float(motion.times[-1]))
         return motion
 
-    def sampled_line(self, name, start, end, seed, speed, end_pitch_deg=None,
+    def sampled_line(self, name, start, end, seed, speed, end_orientation_deg=None,
                      minimum_duration_s=0.0):
-        """Sample XYZ and pitch together, rotating about the calibrated nozzle tip."""
+        """Sample XYZ and A/B/C together, rotating about the calibrated nozzle tip."""
         start, end = np.asarray(start), np.asarray(end)
         distance = float(np.linalg.norm(end - start))
-        start_pitch = self.pitch_deg
-        end_pitch = start_pitch if end_pitch_deg is None else end_pitch_deg
-        pitch_delta = end_pitch - start_pitch
-        if not math.isfinite(pitch_delta):
-            raise ValueError('Pitch change must be finite')
-        if distance <= 0 and pitch_delta == 0:
+        start_orientation = np.asarray(self.orientation, dtype=float)
+        end_orientation = (start_orientation if end_orientation_deg is None
+                           else np.asarray(end_orientation_deg, dtype=float))
+        orientation_delta = end_orientation - start_orientation
+        if not np.all(np.isfinite(orientation_delta)):
+            raise ValueError('Orientation change must be finite')
+        turn_deg = float(np.max(np.abs(orientation_delta)))
+        if distance <= 0 and turn_deg == 0:
             raise ValueError('Cannot plan a zero-length spatial segment without rotation')
         # Smoothstep peak slope is 1.5; bound spatial sample spacing accordingly.
         # One degree also bounds tool0 motion when the nozzle stays at a fixed XYZ.
         intervals = max(4, math.ceil(1.5 * distance / self.config.waypoint_spacing_mm),
-                        math.ceil(1.5 * abs(pitch_delta)))
+                        math.ceil(1.5 * turn_deg))
         if intervals > 10000:
             raise ValueError(f'{name}: more than 10000 intervals')
         fraction = np.linspace(0, 1, intervals + 1)
@@ -284,32 +288,32 @@ class GCodePlanner(MotionPlanner):
         positions = [np.asarray(seed)]
         self.check_pose(seed, start, start)
         for point, u in zip(xyz[1:], progress[1:]):
-            rotation = self.rotation_for(start_pitch + u * pitch_delta)
+            rotation = self.rotation_for(start_orientation + u * orientation_delta)
             joints = self.solve(point, positions[-1], rotation)
             if np.max(np.abs(np.rad2deg(joints - positions[-1]))) > self.config.max_joint_step_deg:
                 raise ValueError(f'{name}: discontinuous IK solution')
             positions.append(joints)
         # F is a peak Cartesian speed, not the average of an accelerating segment.
         duration = max(1.5 * distance / speed, self.settings.minimum_segment_duration_s,
-                       1.5 * abs(pitch_delta) / self.config.max_joint_speed_deg_s,
+                       1.5 * turn_deg / self.config.max_joint_speed_deg_s,
                        minimum_duration_s)
         times = fraction * duration
         positions = np.asarray(positions)
         velocities = np.gradient(positions, times, axis=0)
         velocities[[0, -1]] = 0.0
         motion = self.retime(PlannedMotion(name, positions, velocities, times))
-        if pitch_delta:
+        if turn_deg:
             def pose_at(index, fraction):
                 u = (index + fraction) / intervals
                 progress = u**2 * (3 - 2 * u)
                 return (start + progress * (end - start),
-                        self.rotation_for(start_pitch + progress * pitch_delta))
+                        self.rotation_for(start_orientation + progress * orientation_delta))
 
             self.check_motion(motion, pose_at=pose_at)
         else:
             self.check_motion(motion, xyz)
-        self.pitch_deg = end_pitch
-        self.rotation = self.rotation_for(end_pitch)
+        self.orientation = tuple(float(value) for value in end_orientation)
+        self.rotation = self.rotation_for(self.orientation)
         return motion
 
     def speed_for(self, segment):
@@ -327,21 +331,15 @@ class GCodePlanner(MotionPlanner):
     def plan_segments(self, segments, seed, progress_callback=None):
         """Preflight the entire file, including positioning and a final nozzle lift."""
         cfg = self.settings
-        segments = [replace(
-            segment,
-            start_pitch_deg=(cfg.nozzle_pitch_deg if segment.start_pitch_deg is None
-                             else segment.start_pitch_deg),
-            nozzle_pitch_deg=(cfg.nozzle_pitch_deg if segment.nozzle_pitch_deg is None
-                              else segment.nozzle_pitch_deg),
-        ) for segment in segments]
         segments = [segment for segment in segments
                     if not (segment.kind == 'orientation' and segment.delta_e == 0 and
-                            segment.start_pitch_deg == segment.nozzle_pitch_deg)]
+                            segment.start_orientation_deg == segment.orientation_deg)]
         if cfg.bed_probe_file:
-            # Check every commanded angle, even when the default matched a tilted probe.
-            for pitch in {segment.nozzle_pitch_deg for segment in segments}:
+            # Check every commanded orientation, even when the default matched a tilted probe.
+            for a, b, c in {segment.orientation_deg for segment in segments}:
                 BedSurface.load(cfg.bed_probe_file, self.config.tcp_offset_mm,
-                                (cfg.nozzle_roll_deg, pitch, cfg.wrist_angle),
+                                (cfg.nozzle_roll_deg + a, cfg.nozzle_pitch_deg + b,
+                                 cfg.wrist_angle + c),
                                 cfg.bed_probe_extrapolation_mm)
         # Initial travel commands establish the print start. In particular, an initial
         # Z-hop has no known XY yet; approach above the first XY positioning move.
@@ -360,8 +358,9 @@ class GCodePlanner(MotionPlanner):
         first = spatial[0]
         # A non-extruding initial move establishes the start, as in the old entry point.
         skip_first = first is segments[0] and first.delta_e == 0
-        self.pitch_deg = first.nozzle_pitch_deg if skip_first else segments[0].start_pitch_deg
-        self.rotation = self.rotation_for(self.pitch_deg)
+        self.orientation = (first.orientation_deg if skip_first
+                            else segments[0].start_orientation_deg)
+        self.rotation = self.rotation_for(self.orientation)
         if self.bed is not None:
             # Straight robot lines between nearby points follow the curved bed. The skipped
             # entry move starts at the G-code origin and is never executed, so keep it whole.
@@ -396,7 +395,7 @@ class GCodePlanner(MotionPlanner):
                 if segment.kind == 'dwell':
                     steps.append(PlannedStep(transformed, duration_s=segment.dwell_s))
                     continue
-                turning = segment.nozzle_pitch_deg != self.pitch_deg
+                turning = segment.orientation_deg != self.orientation
                 if segment.length_mm < 1e-9 and not turning:
                     if transformed.delta_e == 0:
                         continue
@@ -420,7 +419,7 @@ class GCodePlanner(MotionPlanner):
                     while skip_until < len(segments):
                         following = segments[skip_until]
                         if (following.kind == 'dwell' or following.length_mm < 1e-9 or
-                                following.nozzle_pitch_deg != self.pitch_deg or
+                                following.orientation_deg != self.orientation or
                                 np.sign(following.delta_e * cfg.extrusion_scale_factor) !=
                                 np.sign(transformed.delta_e)):
                             break
@@ -457,7 +456,7 @@ class GCodePlanner(MotionPlanner):
                 motion = self.sampled_line(
                     'orientation' if segment.length_mm < 1e-9 else
                     ('print' if transformed.delta_e else 'travel'), transformed.start,
-                    transformed.end, joints, speed, segment.nozzle_pitch_deg,
+                    transformed.end, joints, speed, segment.orientation_deg,
                     1.5 * abs(transformed.delta_e) / extrusion_speed,
                 )
                 extrusion = None
