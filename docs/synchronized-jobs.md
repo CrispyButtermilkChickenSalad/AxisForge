@@ -20,6 +20,9 @@ ros2 run print_control axisforge_sync_worker \
 
 Without `--enable-motion`, nonmoving plan validation works but motion is rejected.
 Docker's `sync-worker` service translates `AXISFORGE_SYNC_ENABLE=1` to that flag.
+Its launcher uses one BLAS thread for the small IK systems, avoiding numerical
+thread contention with ROS feedback during preflight. For a native launch on a
+multicore host, use `OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 ros2 run ...` as well.
 The Bridge and worker must run on the same host clock. The server binds only to
 127.0.0.1 and rejects browser Origin headers. Configure the Bridge with
 `AXISFORGE_SYNC_URL=http://127.0.0.1:8081`.
@@ -64,6 +67,10 @@ The worker requires a 1-second lease, fresh feedback within 250 ms, speed scalin
 A failure cancels the action and uses dashboard Stop if cancellation fails. The
 Bridge also has a separate rosbridge Stop path for worker failure. Klipper has its
 own watchdog and shuts down if already committed extrusion must be aborted.
+Lease renewal uses only in-memory session state, keeping ROS queries and
+configuration-file reads out of the heartbeat handler. These checks still run
+for motion requests and execution monitoring. The Bridge renews each participant
+independently and aborts if a heartbeat response takes longer than 0.5 s.
 Neither software watchdogs nor preflight replace the physical stop circuit or
 validate all external obstacles. Physical timing must be commissioned on the cell.
 
@@ -71,6 +78,13 @@ There is no mid-chunk pause/resume or adaptive speed slider support. This v1
 schedule stops at every source move and waits between chunks. Reduce the master's
 linear/angular speed and acceleration limits and repeat preflight if the arm
 cannot follow the schedule. Do not relax joint limits to conceal a timing error.
+
+An error naming a G-code line concerns the master-timed print path. The report
+includes the limiting joint, measured speed/acceleration and configured bound.
+Adjust Klipper's `[axisforge_sync]` limits for that path; `approach_duration_s`
+affects only the entry approach. The worker coalesces sub-nanosecond duplicate
+phase timestamps caused by floating-point roundoff, preserving the master's
+move duration and all phase boundaries representable by ROS timestamps.
 
 ## Validation
 

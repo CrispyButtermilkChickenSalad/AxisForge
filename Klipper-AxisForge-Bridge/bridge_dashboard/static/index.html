@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0d1117">
+    <title>AxisForge + Klipper</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>AxisForge <span>×</span> Klipper</h1>
+      </div>
+      <div class="system-status" aria-live="polite">
+        <span id="overall-dot" class="dot"></span>
+        <span id="overall-state">Connecting…</span>
+      </div>
+    </header>
+    <nav class="tool-tabs" aria-label="Dashboard and connected tools">
+      <a id="dashboard-tab" class="tool-tab active" href="/" aria-current="page">Dashboard</a>
+      <a id="printer-ui-placeholder" class="tool-tab unavailable" href="#" aria-disabled="true">Fluidd / Mainsail</a>
+      <a id="fluidd-link" class="tool-tab external" target="_blank" rel="noopener noreferrer" hidden>Fluidd</a>
+      <a id="mainsail-link" class="tool-tab external" target="_blank" rel="noopener noreferrer" hidden>Mainsail</a>
+      <a id="alps-link" class="tool-tab external" href="https://crispybuttermilkchickensalad.github.io/ALPS-logger/" target="_blank" rel="noopener noreferrer">ALPS Logger</a>
+    </nav>
+
+    <main id="dashboard-view">
+      <section class="card workflow-card" aria-label="G-code execution workflow">
+        <div class="workflow-title">
+          <h2>G-code job pipeline</h2>
+          <span id="sync-availability-badge" class="badge">Select a job</span>
+        </div>
+        <ol class="workflow-steps">
+          <li><span class="step-number">1</span><div><strong>Upload G-code</strong><p>Store the same file on both systems</p></div></li>
+          <li><span class="step-number">2</span><div><strong>Run preflight</strong><p id="step-klipper">Check heaters, then switch them off</p><p id="step-robot">Validate robot motion and timing</p></div></li>
+          <li><span class="step-number">3</span><div><strong>Start synchronized job</strong><p id="step-sync">Preflight required</p></div></li>
+        </ol>
+        <p class="pipeline-note">Klipper sets the motion timeline. The robot must accept each timed chunk before Klipper queues its extrusion. Both systems stop at chunk boundaries and wait for completion.</p>
+      </section>
+
+      <section class="card upload-card" aria-label="Upload G-code">
+        <h2>Upload G-code</h2>
+        <p class="muted">Upload the original file to Klipper and stage it for AxisForge. Uploading does not heat or move either system.</p>
+        <form id="upload-form" class="upload-form">
+          <label for="gcode-upload">G-code file</label>
+          <input id="gcode-upload" name="file" type="file" accept=".gcode" required>
+          <button id="upload-job" class="button primary" type="submit">Upload to both</button>
+        </form>
+        <p id="upload-message" class="inline-message" role="status"></p>
+      </section>
+
+      <section class="card queue-card" aria-label="Job preflight">
+        <div class="card-heading">
+          <h2>Job preflight</h2>
+          <span id="preflight-badge" class="badge">No job selected</span>
+        </div>
+        <label for="job-select">G-code file</label>
+        <select id="job-select"><option value="">Loading jobs…</option></select>
+        <div id="jobs-message" class="inline-message" role="status"></div>
+        <p class="muted">Choose which heaters to check. Preflight heats only the selected heaters to their G-code targets, then switches all heaters off before checking the robot. Robot preflight does not move the arm.</p>
+        <fieldset id="heater-check-options" class="heater-check-options" aria-describedby="heater-options-note">
+          <legend>Preflight heater checks</legend>
+          <label class="check-row" for="check-extruder"><input id="check-extruder" type="checkbox" checked><span>Check extruder heater <small id="extruder-check-state">Detecting…</small></span></label>
+          <label class="check-row" for="check-bed"><input id="check-bed" type="checkbox" checked><span>Check bed heater <small id="bed-check-state">Detecting…</small></span></label>
+        </fieldset>
+        <p id="heater-options-note" class="chart-caption">Configured heaters still follow G-code at Start. If a heater is not configured and its check is off, its commands are ignored for this job. Off targets (0 °C) need no heat test.</p>
+        <div class="button-row">
+          <button id="preflight-both" class="button primary" type="button" disabled>Run preflight</button>
+        </div>
+        <div id="preflight-progress-container" class="preflight-progress" hidden>
+          <label for="preflight-progress" id="preflight-progress-label">Preflight progress</label>
+          <progress id="preflight-progress" aria-describedby="preflight-progress-detail"></progress>
+          <p id="preflight-progress-detail" class="chart-caption" role="status"></p>
+        </div>
+        <ul id="preflight-checks" class="preflight-checks"></ul>
+        <p id="preflight-message" class="inline-message" role="status"></p>
+        <p class="muted">Start reheats configured heaters and moves the arm. Keep the work area clear and the UR speed slider at 100%. Run preflight again after changing heater options. Results expire after 15 minutes or when the file or calibration changes.</p>
+        <div class="button-row">
+          <button id="sync-start" class="button primary" type="button" disabled>Start synchronized job</button>
+          <button id="sync-abort" class="button danger" type="button" disabled>Abort both</button>
+        </div>
+        <p id="sync-message" class="inline-message" role="status">Sync: idle</p>
+      </section>
+
+      <section class="grid status-grid" aria-label="System status">
+        <article class="card status-card">
+          <div class="card-heading">
+            <h2>ROS 2 / UR16e</h2>
+            <span id="ros-badge" class="badge">Connecting</span>
+          </div>
+          <dl>
+            <div><dt>Joint feedback</dt><dd id="joint-state">Waiting</dd></div>
+            <div><dt>Joint names</dt><dd id="joint-count">—</dd></div>
+          </dl>
+        </article>
+        <article class="card status-card">
+          <div class="card-heading">
+            <h2>Klipper</h2>
+            <span id="klipper-badge" class="badge">Connecting</span>
+          </div>
+          <dl>
+            <div><dt>State</dt><dd id="klipper-state">—</dd></div>
+            <div><dt>Extruder</dt><dd id="extruder-temp">—</dd></div>
+            <div><dt>Bed</dt><dd id="bed-temp">—</dd></div>
+          </dl>
+        </article>
+        <article class="card status-card job-status">
+          <div class="card-heading">
+            <h2>AxisForge</h2>
+            <span id="job-badge" class="badge">Idle</span>
+          </div>
+          <dl>
+            <div><dt>File</dt><dd id="job-name">No active job</dd></div>
+            <div><dt>Mode</dt><dd id="job-mode">—</dd></div>
+          </dl>
+        </article>
+      </section>
+
+      <section class="card telemetry-card" aria-label="Read-only Klipper toolhead telemetry">
+        <div class="card-heading">
+          <div>
+            <h2>Klipper toolhead</h2>
+            <p class="telemetry-subtitle">Read-only. Manual controls are locked during a synchronized job.</p>
+            <p id="telemetry-updated" class="telemetry-subtitle"></p>
+          </div>
+          <span class="badge">Read only</span>
+        </div>
+        <p id="telemetry-message" class="inline-message" role="status">Loading toolhead data…</p>
+        <div class="telemetry-grid">
+          <div>
+            <h3>Temperatures and targets</h3>
+            <dl id="telemetry-temperatures" class="telemetry-list"></dl>
+          </div>
+          <div>
+            <h3>Fans</h3>
+            <dl id="telemetry-fans" class="telemetry-list"></dl>
+            <div class="print-summary">
+              <h3>Klipper print status</h3>
+              <p id="print-status" class="chart-caption">Loading…</p>
+              <div class="print-metrics">
+                <div title="Klipper toolhead speed; extrusion-only motion may report zero"><span>Speed</span><strong id="print-speed">—</strong></div>
+                <div><span>Flow</span><strong id="print-flow">—</strong></div>
+                <div><span>Filament</span><strong id="print-filament">—</strong></div>
+                <div><span>Layer</span><strong id="print-layer">—</strong></div>
+                <div title="Estimated remaining time from file progress"><span>Estimate</span><strong id="print-estimate">—</strong></div>
+                <div title="Total print time estimated by the slicer"><span>Slicer</span><strong id="print-slicer">—</strong></div>
+                <div title="Total elapsed time including preparation"><span>Total</span><strong id="print-total">—</strong></div>
+                <div><span>ETA</span><strong id="print-eta">—</strong></div>
+              </div>
+              <p id="print-info-message" class="inline-message" role="status"></p>
+            </div>
+          </div>
+        </div>
+        <div class="temperature-chart">
+          <h3>Temperature history</h3>
+          <p class="chart-caption">Up to 3 minutes · oldest to newest</p>
+          <canvas id="temperature-chart" height="200" role="img" aria-label="Recent temperatures in degrees Celsius"></canvas>
+          <p id="temperature-chart-message" class="inline-message" role="status"></p>
+        </div>
+      </section>
+
+      <section class="grid controls-grid">
+        <article class="card">
+          <h2>Standalone planning diagnostic</h2>
+          <p class="muted">Checks the selected file with the standalone AxisForge planner. Use Run preflight above to validate a synchronized job.</p>
+          <div class="button-row">
+            <button id="start-job" class="button primary" disabled>Run planning check</button>
+            <button id="stop-job" class="button danger" disabled>Stop robot job</button>
+          </div>
+          <p id="job-message" class="inline-message" role="status"></p>
+        </article>
+
+      </section>
+
+      <section class="card safety-card">
+        <div class="emergency-panel">
+          <div>
+            <strong>Emergency stop both systems</strong>
+            <p>Requests stop on both systems. Keep physical E-stops accessible.</p>
+          </div>
+          <button id="klipper-estop" class="button danger">E-stop both</button>
+        </div>
+        <p id="safety-message" class="inline-message" role="status"></p>
+      </section>
+    </main>
+    <section id="embedded-view" class="embedded-view" aria-label="Connected tool" hidden>
+      <div class="embedded-heading">
+        <h2 id="embedded-title"></h2>
+        <a id="embedded-external" class="button secondary" target="_blank" rel="noopener noreferrer">Open in new tab ↗</a>
+      </div>
+      <p id="embedded-message" class="muted" role="status"></p>
+      <p id="printer-warning" class="printer-warning" role="alert" hidden>
+        Reserve non-emergency changes in Fluidd/Mainsail for when no print is running. Manual controls are locked during a synchronized job. This warning does not block the printer controls; use emergency stops whenever needed.
+      </p>
+      <div id="embedded-frames"></div>
+    </section>
+    <footer>Keep the UR pendant and physical E-stop accessible.</footer>
+    <script src="/static/app.js" defer></script>
+  </body>
+</html>

@@ -36,13 +36,14 @@ class RobotWorker:
 
     def status(self):
         feedback = self.backend.feedback()
+        config_hash = configuration(self.config_path)[2]
         with self.lock:
             return {'protocol':PROTOCOL, 'enabled':self.enabled,
                     'control_ready':self.enabled and feedback['ready'],
                     'state':self.state, 'error':self.error, 'session':self.session,
                     'progress':self.progress, 'next_chunk':self.next_chunk,
                     'plan_hash':None if not self.compiled else self.compiled.plan['plan_hash'],
-                    'config_hash':configuration(self.config_path)[2],
+                    'config_hash':config_hash,
                     'compiled_config_hash':None if not self.compiled else self.compiled.config_hash,
                     'feedback':feedback, 'leased':self.lease}
 
@@ -106,7 +107,9 @@ class RobotWorker:
             if not self.lease or self.clock() >= self.deadline:
                 raise ValueError('Robot heartbeat arrived after the lease expired')
             self.deadline = self.clock()+self.lease_s
-            return self.status()
+            # Lease renewal must not perform disk/configuration or ROS queries.
+            # Those checks still run for every motion request and execution tick.
+            return {'state':self.state, 'session':self.session, 'leased':self.lease}
 
     def release(self, data):
         with self.lock:

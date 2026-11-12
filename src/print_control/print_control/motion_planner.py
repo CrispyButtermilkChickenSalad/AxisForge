@@ -166,7 +166,8 @@ class MotionPlanner:
         self.check_pose(joints, point, point, rotation)
         return joints
 
-    def check_motion(self, motion, xyz=None, pose_at=None):
+    def check_motion(self, motion, xyz=None, pose_at=None,
+                     timing_hint='reduce speed or increase approach_duration_s'):
         """Sample cubic geometry; also include each joint's velocity extrema."""
         cfg = self.config
         for index, dt in enumerate(np.diff(motion.times)):
@@ -185,15 +186,21 @@ class MotionPlanner:
             for fraction in samples:
                 q, velocity, acceleration = cubic_joint_state(q0, q1, v0, v1, dt, fraction)
                 self.check_joints(q)
-                if np.max(np.abs(np.rad2deg(velocity))) > cfg.max_joint_speed_deg_s:
+                speed = np.abs(np.rad2deg(velocity))
+                accel = np.abs(np.rad2deg(acceleration))
+                if np.max(speed) > cfg.max_joint_speed_deg_s:
+                    joint = int(np.argmax(speed))
                     raise ValueError(
-                        f'{motion.name}: joint speed too high; '
-                        'reduce speed or increase approach_duration_s'
+                        f'{motion.name}: joint speed too high '
+                        f'({JOINT_NAMES[joint]} {speed[joint]:.2f} deg/s > '
+                        f'{cfg.max_joint_speed_deg_s:.2f} deg/s); {timing_hint}'
                     )
-                if np.max(np.abs(np.rad2deg(acceleration))) > cfg.max_joint_acceleration_deg_s2:
+                if np.max(accel) > cfg.max_joint_acceleration_deg_s2:
+                    joint = int(np.argmax(accel))
                     raise ValueError(
-                        f'{motion.name}: joint acceleration too high; '
-                        'reduce speed or increase approach_duration_s'
+                        f'{motion.name}: joint acceleration too high '
+                        f'({JOINT_NAMES[joint]} {accel[joint]:.2f} deg/s^2 > '
+                        f'{cfg.max_joint_acceleration_deg_s2:.2f} deg/s^2); {timing_hint}'
                     )
                 if xyz is not None:
                     self.check_pose(q, xyz[index], xyz[index + 1])

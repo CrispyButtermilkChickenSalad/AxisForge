@@ -47,6 +47,30 @@ def progress(profile, seconds):
     return 1.-.5*a*(profile['duration_s']-t)**2
 
 
+def sample_times(profile):
+    """Sample each phase without duplicate times from floating-point roundoff.
+
+    A triangular profile can report a tiny positive cruise (around 1e-17 s).
+    Keeping both sides creates effectively zero intervals in joint derivatives.
+    Coalesce only sub-nanosecond intervals, below the ROS timestamp resolution;
+    keep the original start/end and all resolvable phase boundaries.
+    """
+    duration = profile['duration_s']
+    boundaries = (0., profile['ramp_s'], profile['ramp_s']+profile['cruise_s'], duration)
+    candidates = sorted(t for left,right in zip(boundaries, boundaries[1:])
+                        for t in np.linspace(left, right, max(2, math.ceil((right-left)/.02)+1)))
+    if len(set(candidates)) < 5:
+        candidates = sorted(candidates+list(np.linspace(0.,duration,5)))
+    times = [0.]
+    for t in candidates:
+        if t-times[-1] >= 1e-9: times.append(float(t))
+    if duration-times[-1] < 1e-9: times[-1] = duration
+    else: times.append(duration)
+    if len(times) < 2 or np.min(np.diff(times)) < 1e-9:
+        raise ValueError('Master move is too short for ROS trajectory timestamps')
+    return np.array(times)
+
+
 def validate_plan(plan):
     """Reject forged/inconsistent timing before IK or command construction."""
     if not isinstance(plan, dict) or plan.get('protocol') != PROTOCOL:
@@ -147,12 +171,7 @@ class TimedPath:
         return np.asarray(self.planner.transform(pose[:3])), self.planner.rotation_for(pose[3:])
 
     def _move(self, record, seed, cancelled):
-        p = record['profile']
-        boundaries = (0., p['ramp_s'], p['ramp_s']+p['cruise_s'], p['duration_s'])
-        times = sorted(set(t for left,right in zip(boundaries, boundaries[1:])
-                           for t in np.linspace(left, right, max(2, math.ceil((right-left)/.02)+1))))
-        if len(times) < 5:
-            times = sorted(set(times+list(np.linspace(0., p['duration_s'], 5))))
+        times = sample_times(record['profile'])
         positions = [np.asarray(seed)]
         start, rotation = self._pose(record, 0.)
         self.planner.check_pose(seed, start, start, rotation)
@@ -172,7 +191,10 @@ class TimedPath:
             return self._pose(record, times[index]+fraction*(times[index+1]-times[index]))
 
         # check_motion includes cubic-interpolation extrema, joint velocity and acceleration.
-        self.planner.check_motion(motion, pose_at=pose_at)
+        self.planner.check_motion(motion, pose_at=pose_at,
+            timing_hint='reduce max_velocity/max_accel or angular limits in Klipper '
+                        '[axisforge_sync] and rerun preflight; approach_duration_s '
+                        'only affects the entry approach')
         return motion
 
     def approach(self, current_joints):

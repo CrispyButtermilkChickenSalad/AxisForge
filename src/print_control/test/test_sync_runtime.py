@@ -50,6 +50,21 @@ class WorkerTests(unittest.TestCase):
         self.assertIn('heartbeat',self.worker.error)
         self.assertEqual(self.backend.cancelled,['goal'])
 
+    def test_heartbeat_does_not_wait_for_feedback_or_configuration_io(self):
+        self.worker.acquire(self.data)
+        self.now += .5
+        self.backend.feedback=lambda:(_ for _ in ()).throw(RuntimeError('ROS query busy'))
+        with patch('print_control.sync_runtime.configuration',side_effect=OSError('Config I/O busy')):
+            result=self.worker.heartbeat(self.data)
+        self.assertEqual(result,{'state':'ready','session':self.worker.session,'leased':True})
+        self.assertEqual(self.worker.deadline,self.now+1.)
+
+    def test_heartbeat_cannot_revive_an_expired_lease(self):
+        self.worker.acquire(self.data)
+        self.now += 1.01
+        with self.assertRaisesRegex(ValueError,'lease|heartbeat'):
+            self.worker.heartbeat(self.data)
+
     def test_cancel_failure_uses_dashboard_stop(self):
         self.worker.goal='goal'; self.backend.fail_cancel=True
         result=self.worker.abort(dict(self.data,reason='operator'))
