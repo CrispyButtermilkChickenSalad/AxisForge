@@ -60,3 +60,13 @@ __pycache__/
 
 # Local micro-ROS Agent workspace (sources and build artifacts)
 /.micro_ros_ws/
+
+# Docker-only colcon artifacts and local Compose settings
+/.docker/
+/.env
+/.axisforge-robot-control.lock
+**/*.tcp-backup
+**/bed_probe.pending.yaml
+**/bed_probe.simulated.yaml
+**/bed_probe.simulated.pending.yaml
+**/bed_probe.yaml.*.bak

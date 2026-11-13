@@ -23,6 +23,10 @@ setup(
             'gcode_interpreter = print_control.gcode_interpreter:main',
             'keyboard_node = print_control.keyboard:main',
             'bed_probe = print_control.bed_probe:main',
+            'bridge_bed_probe = print_control.bridge_bed_probe:main',
+            'alps_load_calibration = print_control.alps_load_calibration:main',
+            'klipper_follower = print_control.klipper_follower:main',
+            'axisforge_sync_worker = print_control.sync_runtime:main',
         ],
     },
 )

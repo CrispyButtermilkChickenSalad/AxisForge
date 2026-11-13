@@ -1,0 +1,16 @@
+# Commission using a known load in the upright probing orientation first.
+# These are initial low-force settings, not a measured hardware load rating.
+contact_force_g: 50.0
+max_force_g: 200.0
+step_mm: 0.02
+speed_mm_s: 0.2
+retract_mm: 0.5
+samples: 3
+repeatability_mm: 0.05
+# Add a measured compliance correction to the recorded contact Z, if needed.
+contact_offset_mm: 0.0
+settle_s: 0.15
+window_s: 0.1
+max_sample_age_s: 0.3
+max_nozzle_temp_c: 50.0
+consecutive_samples: 5

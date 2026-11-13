@@ -1,0 +1,52 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+  font-synthesis: none;
+  --panel: #161b22;
+  --line: #30363d;
+  --muted: #8b949e;
+  --purple: #8957e5;
+}
+
+* { box-sizing: border-box; }
+body { min-width: 320px; margin: 0; background: radial-gradient(ellipse at 70% -15%, #24133f 0, transparent 46%), #0d1117; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px max(24px, calc((100vw - 1080px) / 2)); border-bottom: 1px solid var(--line); }
+.brand { display: inline-flex; align-items: center; gap: 12px; color: inherit; text-decoration: none; }
+.brand-mark { display: grid; width: 40px; height: 40px; place-items: center; border: 1px solid rgba(137, 87, 229, .5); border-radius: 12px; background: rgba(137, 87, 229, .14); color: #c9a7ff; font-weight: 850; }
+.brand strong { font-size: .95rem; }
+.github-link { color: #b6c4d7; font-size: .82rem; text-decoration: none; }
+.github-link:hover { color: #c9a7ff; }
+main { width: min(1080px, calc(100% - 40px)); margin: 54px auto 34px; }
+.intro { max-width: 640px; margin-bottom: 32px; }
+h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); line-height: 1.05; letter-spacing: -.05em; }
+.tool-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
+.tool-card { display: flex; min-height: 240px; flex-direction: column; padding: 22px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); box-shadow: 0 12px 32px rgba(0, 0, 0, .18); }
+.card-top { display: flex; align-items: center; justify-content: space-between; }
+.icon { display: grid; width: 38px; height: 38px; place-items: center; border: 1px solid rgba(137, 87, 229, .45); border-radius: 11px; background: rgba(137, 87, 229, .13); color: #c9a7ff; font-size: 1.05rem; font-weight: 850; }
+.mainsail-icon { color: #c4b5fd; border-color: rgba(196, 181, 253, .34); background: rgba(139, 92, 246, .13); }
+.alps-icon { color: #c9a7ff; border-color: rgba(137, 87, 229, .45); background: rgba(137, 87, 229, .13); }
+h2 { margin: 20px 0 8px; font-size: 1.35rem; letter-spacing: -.03em; }
+.tool-card > p, form > p { color: var(--muted); font-size: .84rem; line-height: 1.55; }
+form { display: flex; flex: 1; flex-direction: column; margin-top: 7px; }
+label { margin: 8px 0; color: #cbd5e1; font-size: .77rem; font-weight: 700; }
+.url-row { display: flex; gap: 8px; }
+input { min-width: 0; flex: 1; padding: 10px 11px; border: 1px solid var(--line); border-radius: 8px; outline: none; background: #0d1117; color: #e6edf3; font: inherit; font-size: .78rem; }
+input:focus { border-color: var(--purple); box-shadow: 0 0 0 3px rgba(137, 87, 229, .18); }
+.button { display: inline-flex; min-height: 39px; align-items: center; justify-content: center; padding: 8px 12px; border: 1px solid transparent; border-radius: 8px; color: #f8fafc; font: inherit; font-size: .78rem; font-weight: 750; text-align: center; text-decoration: none; cursor: pointer; }
+.button:hover { filter: brightness(1.13); }
+.secondary { border-color: var(--line); background: #21262d; }
+.primary { background: #6e40c9; }
+.open-link { width: 100%; margin-top: auto; }
+.open-link[hidden] { display: none; }
+.message { min-height: 18px; margin: 7px 0 12px; color: var(--muted); font-size: .72rem; }
+.message.error { color: #fda4af; }
+.message.success { color: #86efac; }
+.alps-open { margin-top: auto; }
+.boundary { display: flex; gap: 13px; margin-top: 18px; padding: 16px 18px; border: 1px solid rgba(137, 87, 229, .3); border-radius: 11px; background: rgba(137, 87, 229, .08); }
+.boundary strong { font-size: .83rem; }
+.boundary p { margin: 5px 0 0; color: var(--muted); font-size: .78rem; line-height: 1.55; }
+footer { padding: 0 20px 26px; color: #718096; text-align: center; font-size: .73rem; }
+@media (max-width: 850px) { .tool-grid { grid-template-columns: 1fr 1fr; } .alps-card { grid-column: span 2; min-height: 280px; } }
+@media (max-width: 580px) { header { padding: 15px 18px; } .github-link { font-size: .72rem; } main { width: calc(100% - 28px); margin-top: 36px; } .tool-grid { grid-template-columns: 1fr; } .alps-card { grid-column: auto; } .tool-card { min-height: 210px; } .boundary { padding: 14px; } }

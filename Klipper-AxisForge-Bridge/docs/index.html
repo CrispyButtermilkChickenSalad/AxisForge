@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#0d1117">
+    <title>Robot Fabrication Tools</title>
+    <link rel="stylesheet" href="./style.css">
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="./" aria-label="Robot Fabrication Tools home">
+        <span class="brand-mark">K</span>
+        <strong>Klipper tools</strong>
+      </a>
+      <a class="github-link" href="https://github.com/CrispyButtermilkChickenSalad/Klipper-ROS2-Bridge" target="_blank" rel="noopener noreferrer">Bridge repository ↗</a>
+    </header>
+
+    <main>
+      <section class="intro">
+        <h1>Tool links</h1>
+      </section>
+
+      <section class="tool-grid" aria-label="Available tools">
+        <article class="tool-card printer-card">
+          <div class="card-top">
+            <span class="icon">F</span>
+          </div>
+          <h2>Fluidd</h2>
+          <form data-printer="fluidd">
+            <label for="fluidd-url">Fluidd address</label>
+            <div class="url-row">
+              <input id="fluidd-url" type="url" placeholder="http://your-klipper-host/" autocomplete="url" spellcheck="false">
+              <button type="submit" class="button secondary">Save</button>
+            </div>
+            <p id="fluidd-message" class="message" aria-live="polite"></p>
+            <a id="fluidd-open" class="button primary open-link" hidden target="_blank" rel="noopener noreferrer">Open Fluidd ↗</a>
+          </form>
+        </article>
+
+        <article class="tool-card printer-card">
+          <div class="card-top">
+            <span class="icon mainsail-icon">M</span>
+          </div>
+          <h2>Mainsail</h2>
+          <form data-printer="mainsail">
+            <label for="mainsail-url">Mainsail address</label>
+            <div class="url-row">
+              <input id="mainsail-url" type="url" placeholder="http://your-klipper-host/" autocomplete="url" spellcheck="false">
+              <button type="submit" class="button secondary">Save</button>
+            </div>
+            <p id="mainsail-message" class="message" aria-live="polite"></p>
+            <a id="mainsail-open" class="button primary open-link" hidden target="_blank" rel="noopener noreferrer">Open Mainsail ↗</a>
+          </form>
+        </article>
+
+        <article class="tool-card alps-card">
+          <div class="card-top">
+            <span class="icon alps-icon">A</span>
+          </div>
+          <h2>ALPS Logger</h2>
+          <a class="button primary open-link alps-open" href="https://crispybuttermilkchickensalad.github.io/ALPS-logger/" target="_blank" rel="noopener noreferrer">Open ALPS Logger ↗</a>
+        </article>
+      </section>
+
+      <aside class="boundary">
+        <div>
+        <strong>G-code job synchronization and coordinated live changes are not implemented.</strong>
+        <p>Fluidd and Mainsail control Klipper directly. Reserve non-emergency changes for when no print is running; use emergency stops whenever needed. Printer addresses are saved in this browser.</p>
+        </div>
+      </aside>
+    </main>
+
+    <footer>Keep physical emergency stops accessible.</footer>
+    <script src="./app.js" defer></script>
+  </body>
+</html>

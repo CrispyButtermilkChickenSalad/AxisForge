@@ -44,6 +44,8 @@ class BedSurface:
             raise ValueError(f'bed_probe_file not found: {path} '
                              '(run bed_probe from the AxisForge root, or set it to "")')
         data = yaml.safe_load(path.read_text())
+        if data.get('simulated') is True or data.get('complete') is False:
+            raise ValueError(f'{path.name}: simulated or incomplete bed maps cannot be used for printing')
         orientation_note = ''
         for name, current in (('tcp_offset_mm', tcp_offset_mm),
                               ('nozzle_rpy_deg', nozzle_rpy_deg)):
@@ -55,8 +57,10 @@ class BedSurface:
                 continue
             if name == 'nozzle_rpy_deg':
                 roll, pitch, _ = np.deg2rad(probed)
-                upright = math.isclose(math.cos(roll) * math.cos(pitch), -1.0,
-                                       rel_tol=0, abs_tol=1e-10)
+                tolerance = data.get('upright_tolerance_deg', 0.)
+                if type(tolerance) not in (int, float) or not math.isfinite(tolerance) or not 0 <= tolerance <= .2:
+                    raise ValueError('Bed probe upright tolerance must be 0..0.2 degrees')
+                upright = math.cos(roll) * math.cos(pitch) <= -math.cos(math.radians(tolerance))+1e-10
                 calibrated_tip = not np.allclose(tcp_offset_mm, 0.0, rtol=0, atol=1e-3)
                 # Upright touch points locate the bed in Base, independent of the later
                 # print orientation. tool_pose() rotates the same TCP offset for printing.
