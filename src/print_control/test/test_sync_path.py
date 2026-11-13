@@ -106,5 +106,76 @@ class TimedPathTests(unittest.TestCase):
         value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
         with self.assertRaisesRegex(ValueError,'coordinates'): validate_plan(value)
 
+    def continuous_plan(self):
+        value=plan()
+        value['motion_mode']='continuous_runs'
+        first=value['operations'][0]['moves'][0]
+        first.update(end=[111.,110.,5.,0.,0.,0.],
+                     profile={'acceleration':1.,'velocity':1.,'ramp_s':1.,'decel_s':0.,
+                              'cruise_s':.5,'duration_s':1.5,'start_velocity':0.,'end_velocity':1.})
+        second=copy.deepcopy(first)
+        second.update(start=first['end'],end=[112.,110.,5.,0.,0.,0.],offset_s=1.5,source_line=3)
+        second['profile'].update(ramp_s=0.,decel_s=1.,start_velocity=1.,end_velocity=0.)
+        value['operations'][0].update(moves=[first,second],duration_s=3.)
+        value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+        return value
+
+    def test_continuous_junction_has_nonzero_joint_velocity_and_exact_timing(self):
+        value=self.continuous_plan()
+        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        compiled=TimedPath(config,value,np.deg2rad([-3.73,-90,-120,-60,90,0]))
+        motion=compiled.chunks[0]
+        junction=np.flatnonzero(motion.times==1.5)
+        self.assertEqual(len(junction),1)
+        self.assertGreater(np.max(abs(motion.velocities[junction[0]])),1e-5)
+        np.testing.assert_array_equal(motion.velocities[[0,-1]],0.)
+        self.assertEqual(motion.times[-1],3.)
+        np.testing.assert_allclose(compiled.planner.nozzle_position(motion.positions[-1]),
+                                   compiled.planner.transform([112.,110.,5.]),atol=.01)
+
+    def test_nonzero_velocity_through_a_sharp_corner_is_rejected(self):
+        value=self.continuous_plan()
+        value['operations'][0]['moves'][1]['end']=[111.,111.,5.,0.,0.,0.]
+        value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+        with self.assertRaisesRegex(ValueError,'junction velocity'):
+            validate_plan(value)
+
+    def test_forged_asymmetric_profile_is_rejected(self):
+        value=self.continuous_plan()
+        value['operations'][0]['moves'][1]['profile']['decel_s']=.5
+        value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+        with self.assertRaisesRegex(ValueError,'phase times'):
+            validate_plan(value)
+
+    def test_firmware_corner_modes_validate_actual_joint_interpolation(self):
+        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        for policy in ('klipper','marlin'):
+            value=self.continuous_plan()
+            value['motion_options']={'policy':policy}
+            value['operations'][0]['moves'][1]['end']=[111.,111.,5.,0.,0.,0.]
+            value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+            compiled=TimedPath(config,value,np.deg2rad([-3.73,-90,-120,-60,90,0]))
+            corner=np.flatnonzero(compiled.chunks[0].times==1.5)[0]
+            self.assertGreater(np.linalg.norm(compiled.chunks[0].velocities[corner]),0.)
+            self.assertEqual(compiled.chunks[0].times[-1],3.)
+
+    def test_firmware_policy_does_not_permit_rotary_velocity_jumps(self):
+        value=self.continuous_plan()
+        value['motion_options']={'policy':'klipper'}
+        value['operations'][0]['moves'][1]['end'][3]=1.
+        value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+        with self.assertRaisesRegex(ValueError,'junction velocity'): validate_plan(value)
+
+    def test_forged_blend_reference_and_unknown_policy_are_rejected(self):
+        value=self.continuous_plan()
+        value['motion_options']={'policy':'blend','blend_tolerance_mm':.05}
+        move=value['operations'][0]['moves'][0]
+        move.update(blend_segment=True,reference_start=move['start'][:],reference_end=move['end'][:])
+        move['reference_end'][0]+=.04
+        value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
+        with self.assertRaisesRegex(ValueError,'geometric tolerance'): validate_plan(value)
+        value['motion_options']['policy']='unchecked'
+        with self.assertRaisesRegex(ValueError,'corner policy'): validate_plan(value)
+
 
 if __name__=='__main__': unittest.main()

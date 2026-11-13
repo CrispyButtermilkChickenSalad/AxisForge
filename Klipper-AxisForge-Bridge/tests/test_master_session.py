@@ -4,6 +4,8 @@ import hashlib
 from pathlib import Path
 import tempfile
 import time
+import threading
+from unittest.mock import patch
 from types import SimpleNamespace
 import unittest
 
@@ -41,7 +43,8 @@ class Printer:
         self.settings={'printer':{'kinematics':'none'},'virtual_sdcard':{'path':str(root)},
                        'extruder':{},'axisforge_sync':{}}
         self.reactor=SimpleNamespace(monotonic=self.clock,NOW=0.,
-            register_timer=lambda *args:None)
+            register_timer=lambda *args:None,completion=Completion,
+            async_complete=lambda completion,value:completion.complete(value))
         self.extruder=SimpleNamespace(heater=self.heater,last_position=0.,
             max_e_velocity=20.,max_e_accel=100.,max_e_dist=50.,max_extrude_ratio=5.,
             get_status=lambda now:{'pressure_advance':.04},
@@ -74,11 +77,20 @@ class Printer:
         self.extruder.last_position=move.end_pos[3]
 
 
+class Completion:
+    def __init__(self): self.event=threading.Event()
+    def complete(self,value): self.value=value; self.event.set()
+    def wait(self):
+        if not self.event.wait(5.): raise RuntimeError('Test planner did not finish')
+        return self.value
+
+
 class Config:
     def __init__(self,printer): self.printer=printer
     def get_printer(self): return self.printer
     def getboolean(self,name,default): return True if name=='enabled' else default
     def getfloat(self,name,default,**kwargs): return default
+    def get(self,name,default): return default
 
 
 def make_master(root,clock=None):
@@ -126,6 +138,76 @@ class MasterTests(unittest.TestCase):
         self.assertEqual(self.master.state,'fault')
         self.assertFalse(self.printer.queued)
 
+    def test_cold_preflight_extends_only_nonactuating_lease_and_cannot_revive_it(self):
+        call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+        self.assertEqual(self.master.deadline,self.now+3.)
+        self.now+=1.5
+        self.master._watchdog(self.now)
+        self.assertTrue(self.master.leased)
+        reply=call(self.master,'heartbeat',session=self.session)
+        self.assertEqual(reply['watchdog_seconds'],3.)
+        self.now+=3.01
+        with self.assertRaisesRegex(ValueError,'expired'):
+            call(self.master,'heartbeat',session=self.session)
+        self.assertFalse(self.master.leased)
+        self.assertEqual(self.master.state,'fault')
+
+    def test_cold_mode_rejects_actuation_and_restores_strict_deadline(self):
+        call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+        for action,values in (('heat',{'targets':{'extruder':200.}}),('fan',{'speed':1.}),
+                              ('reserve',{'index':0}),('commit',{'token':'invalid'})):
+            with self.subTest(action=action),self.assertRaisesRegex(ValueError,'Cold preflight forbids'):
+                call(self.master,action,session=self.session,**values)
+        self.assertFalse(self.printer.queued)
+        self.assertEqual(self.printer.heater.target,0.)
+        reply=call(self.master,'lease_mode',session=self.session,mode='strict')
+        self.assertEqual(reply['watchdog_seconds'],1.)
+        self.assertEqual(self.master.deadline,self.now+1.)
+        call(self.master,'heat',session=self.session,targets={'extruder':200.})
+        self.now+=1.01
+        self.master._watchdog(self.now)
+        self.assertEqual(self.master.state,'fault')
+        self.assertEqual(self.printer.heater.target,0.)
+
+    def test_cold_entry_rejects_hot_targets_started_print_pending_motion_and_queue(self):
+        for attribute,value in (('print_started',True),('reservation',{'committed':False}),('next_chunk',1)):
+            original=getattr(self.master,attribute);setattr(self.master,attribute,value)
+            with self.subTest(attribute=attribute),self.assertRaisesRegex(ValueError,'non-actuating'):
+                call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+            setattr(self.master,attribute,original)
+        self.printer.heater.target=200.
+        with self.assertRaisesRegex(ValueError,'non-actuating'):
+            call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+        self.printer.heater.target=0.
+        with patch.object(self.master.toolhead,'get_last_move_time',return_value=9999.):
+            with self.assertRaisesRegex(ValueError,'queue is busy'):
+                call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+
+    def test_cold_invariant_violation_aborts_and_turns_heaters_off(self):
+        call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+        self.printer.heater.target=200.
+        self.master._watchdog(self.now)
+        self.assertEqual(self.master.error,'Cold preflight invariant violated')
+        self.assertEqual(self.printer.heater.target,0.)
+        self.assertFalse(self.master.leased)
+
+    def test_strict_transition_rechecks_configuration_and_file(self):
+        call(self.master,'lease_mode',session=self.session,mode='cold_preflight')
+        with patch.object(self.master,'_fingerprint',return_value='changed'):
+            with self.assertRaisesRegex(ValueError,'settings changed'):
+                call(self.master,'lease_mode',session=self.session,mode='strict')
+        self.path.write_text('changed')
+        with self.assertRaisesRegex(ValueError,'Job changed'):
+            call(self.master,'lease_mode',session=self.session,mode='strict')
+        self.assertEqual(self.master.lease_mode,'cold_preflight')
+
+    def test_heartbeat_ack_has_no_full_status_or_configuration_work(self):
+        with patch.object(self.master,'_status',side_effect=AssertionError('full status')),\
+             patch.object(self.master,'_fingerprint',side_effect=AssertionError('fingerprint')),\
+             patch.object(self.master,'_clock',side_effect=AssertionError('MCU clock')):
+            reply=call(self.master,'heartbeat',session=self.session)
+        self.assertEqual(set(reply),{'state','session','leased','lease_mode','watchdog_seconds'})
+
     def test_committed_fault_shutdowns_mcu_instead_of_dropping_host_queue(self):
         call(self.master,'heat',session=self.session,targets={'extruder':200.})
         reservation=call(self.master,'reserve',session=self.session,index=0)
@@ -156,6 +238,72 @@ class MasterTests(unittest.TestCase):
         call(self.master,'commit',session=self.session,token=reservation['token'])
         with self.assertRaisesRegex(ValueError,'not finished'):
             call(self.master,'ack',session=self.session,token=reservation['token'])
+
+    def test_continuous_run_is_prequeued_with_adjacent_extrusion_timestamps(self):
+        call(self.master,'release',session=self.session)
+        self.master.continuous_motion=True
+        self.path.write_text('M109 S200\n'+ENTRY+'G1 X111 E.1\nG1 X112 E.2\n')
+        prepared=call(self.master,'prepare',job=self.path.name,
+                      sha256=hashlib.sha256(self.path.read_bytes()).hexdigest())
+        self.session=prepared['session']
+        call(self.master,'acquire',session=self.session)
+        call(self.master,'heat',session=self.session,targets={'extruder':200.})
+        reservation=call(self.master,'reserve',session=self.session,index=0)
+        call(self.master,'commit',session=self.session,token=reservation['token'])
+        chunks=[op for op in prepared['plan']['operations'] if op['kind']=='chunk']
+        self.assertEqual(len(chunks),1)
+        self.assertEqual(len(self.printer.queued),2)
+        (t0,left),(t1,right)=self.printer.queued
+        self.assertAlmostEqual(t1,t0+left.accel_t+left.cruise_t+left.decel_t)
+        self.assertGreater(right.start_v,0.)
+        self.assertEqual(left.end_pos,right.start_pos)
+        self.assertFalse(self.printer.shutdowns)
+
+    def test_slow_prequeue_aborts_even_if_commit_started_before_deadline(self):
+        original=self.printer.extruder.process_move
+        def slow_queue(stamp,move,index):
+            original(stamp,move,index)
+            self.now+=.8
+        self.printer.extruder.process_move=slow_queue
+        call(self.master,'heat',session=self.session,targets={'extruder':200.})
+        reservation=call(self.master,'reserve',session=self.session,index=0)
+        with self.assertRaisesRegex(ValueError,'deadline'):
+            call(self.master,'commit',session=self.session,token=reservation['token'])
+        self.assertTrue(self.printer.shutdowns)
+        self.assertEqual(self.master.state,'fault')
+
+    def test_preparation_yields_blocks_concurrent_ownership_and_rejects_changed_limits(self):
+        from klipper_extras.axisforge_schedule import compile_job
+        call(self.master,'release',session=self.session)
+        entered,finish=threading.Event(),threading.Event()
+        errors=[]
+        def slow(*args):
+            entered.set()
+            if not finish.wait(3.): raise RuntimeError('Test timed out')
+            return compile_job(*args)
+        def prepare():
+            try:
+                call(self.master,'prepare',job=self.path.name,
+                     sha256=hashlib.sha256(self.path.read_bytes()).hexdigest())
+            except Exception as error: errors.append(str(error))
+        with patch('klipper_extras.axisforge_sync.compile_job',side_effect=slow):
+            thread=threading.Thread(target=prepare)
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(2.))
+                self.assertTrue(self.master.preparing)
+                self.assertIn('print_time',call(self.master,'clock'))
+                with self.assertRaisesRegex(ValueError,'being prepared'):
+                    call(self.master,'prepare')
+                with self.assertRaisesRegex(ValueError,'being prepared'):
+                    call(self.master,'acquire',session=self.session)
+                self.printer.objects['toolhead'].get_max_velocity=lambda:(10.,10.)
+            finally:
+                finish.set(); thread.join(3.)
+        self.assertEqual(len(errors),1)
+        self.assertIn('settings changed during preparation',errors[0])
+        self.assertFalse(self.master.preparing)
+        self.assertFalse(self.printer.queued)
 
 
 if __name__=='__main__': unittest.main()

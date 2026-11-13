@@ -112,4 +112,73 @@ class ScheduleTests(unittest.TestCase):
         with self.assertRaises(ValueError): progress(p,math.inf)
 
 
+class ContinuousScheduleTests(unittest.TestCase):
+    def compile(self,text):
+        return compile_job(text,dict(LIMITS,continuous_motion=True,
+                                    extrusion_corner_velocity=1.),HEATERS)
+
+    def test_collinear_moves_share_speed_and_one_queued_run(self):
+        source='M109 S200\n'+ENTRY+''.join('G1 X%g E%g\n' % (110+i,i*.1) for i in range(1,21))
+        old=compile_job(source,LIMITS,HEATERS)
+        new=self.compile(source)
+        chunks=[op for op in new['operations'] if op['kind']=='chunk']
+        self.assertEqual(len(chunks),1)
+        moves=chunks[0]['moves']
+        self.assertEqual(len(moves),20)
+        self.assertEqual(new['motion_mode'],'continuous_runs')
+        self.assertLess(new['duration_s'],old['duration_s'])
+        original=[m for op in old['operations'] if op['kind']=='chunk' for m in op['moves']]
+        for before,after in zip(original,moves):
+            for field in ('start','end','e_start','delta_e','source_line'):
+                self.assertEqual(before[field],after[field])
+        for left,right in zip(moves,moves[1:]):
+            self.assertGreater(left['profile']['end_velocity'],0.)
+            self.assertAlmostEqual(left['profile']['end_velocity'],right['profile']['start_velocity'])
+            self.assertAlmostEqual(left['offset_s']+left['profile']['duration_s'],right['offset_s'])
+        self.assertEqual(moves[0]['profile']['start_velocity'],0.)
+        self.assertEqual(moves[-1]['profile']['end_velocity'],0.)
+
+    def test_sharp_corners_and_rotary_tangent_changes_still_stop(self):
+        for tail in ('G1 X111\nG1 Y111\n','G1 X111 A1\nG1 X112 A3\n',
+                     'G1 X111\nG1 X110\n'):
+            plan=self.compile(ENTRY+tail)
+            moves=plan['operations'][-1]['moves']
+            self.assertEqual(moves[0]['profile']['end_velocity'],0.)
+            self.assertEqual(moves[1]['profile']['start_velocity'],0.)
+
+    def test_semantic_barriers_split_runs_even_when_the_pause_is_zero(self):
+        for barrier in ('M400','G4 P0','G4 P20','M106 S128','M109 S200'):
+            plan=self.compile(ENTRY+'G1 X111\n'+barrier+'\nG1 X112\n')
+            chunks=[op for op in plan['operations'] if op['kind']=='chunk']
+            self.assertEqual(len(chunks),2,barrier)
+            self.assertEqual(chunks[0]['moves'][-1]['profile']['end_velocity'],0.)
+            self.assertEqual(chunks[1]['moves'][0]['profile']['start_velocity'],0.)
+
+    def test_asymmetric_profiles_integrate_to_the_original_endpoints(self):
+        plan=self.compile(ENTRY+'G1 X111\nG1 X112\nG1 X113\n')
+        for move in plan['operations'][-1]['moves']:
+            p=move['profile']
+            self.assertAlmostEqual(progress(p,0.)[0],0.)
+            self.assertAlmostEqual(progress(p,p['duration_s'])[0],1.)
+            self.assertAlmostEqual(progress(p,0.)[1],p['start_velocity'])
+            self.assertAlmostEqual(progress(p,p['duration_s'])[1],p['end_velocity'])
+            integral=(p['start_velocity']+p['velocity'])*p['ramp_s']/2
+            integral+=p['velocity']*p['cruise_s']
+            integral+=(p['end_velocity']+p['velocity'])*p['decel_s']/2
+            self.assertAlmostEqual(integral,1.)
+            self.assertLessEqual(p['velocity'],LIMITS['linear_velocity'])
+            self.assertLessEqual(p['acceleration'],LIMITS['linear_acceleration'])
+
+    def test_extrusion_ratio_changes_obey_the_klipper_junction_limit(self):
+        plan=self.compile('M109 S200\n'+ENTRY+'G1 X111 E.1\nG1 X112 E1.1\n')
+        moves=plan['operations'][-1]['moves']
+        self.assertLessEqual(moves[0]['profile']['end_velocity'],1./.9+1e-9)
+        self.assertGreater(moves[0]['profile']['end_velocity'],0.)
+
+    def test_extrusion_direction_changes_do_not_blend(self):
+        plan=self.compile('M109 S200\n'+ENTRY+'M83\nG1 E1\nG1 E-1\nG1 X111 E1\n')
+        moves=plan['operations'][-1]['moves']
+        self.assertTrue(all(m['profile']['end_velocity']==0 for m in moves))
+
+
 if __name__=='__main__': unittest.main()

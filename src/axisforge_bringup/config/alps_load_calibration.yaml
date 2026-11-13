@@ -1,0 +1,13 @@
+# Raw counts only. Before contact, select max(8000, 4.1 * measured peak-to-peak
+# noise), capped at 20000. These are commissioning values, not factory defaults.
+contact:
+  trigger_mode: raw
+  contact_delta_counts: 20000.0
+  max_delta_counts: 60000.0
+  step_mm: 0.01
+  speed_mm_s: 0.1
+  retract_mm: 5.0
+  consecutive_samples: 5
+homing:
+  confirmation_timeout_s: 300.0
+  heartbeat_timeout_s: 5.0

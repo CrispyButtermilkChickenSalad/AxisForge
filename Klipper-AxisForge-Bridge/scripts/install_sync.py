@@ -15,7 +15,7 @@ def install(source, klipper, config):
     extras=klipper/'klippy/extras'
     if not extras.is_dir() or not config.is_file():
         raise ValueError('Check --klipper-dir and --config paths')
-    modules=['axisforge_sync.py','axisforge_schedule.py']
+    modules=['axisforge_sync.py','axisforge_schedule.py','axisforge_corners.py']
     for name in modules:
         compile((source/name).read_text(),name,'exec')
     original=config.read_text()
@@ -27,6 +27,7 @@ max_velocity: 20
 max_accel: 20
 max_angular_velocity: 10
 max_angular_accel: 20
+continuous_motion: True
 chunk_seconds: 2
 watchdog_seconds: 1
 start_lead_seconds: 1

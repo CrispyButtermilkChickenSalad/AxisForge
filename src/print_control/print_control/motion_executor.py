@@ -16,6 +16,7 @@ from trajectory_msgs.msg import JointTrajectoryPoint
 
 from extrusion_control.extrusion_calibration import MAX_STEPPER_SPEED
 from print_control.motion_planner import JOINT_NAMES, duration_parts
+from print_control.robot_ownership import RobotControlLock
 
 EXTRUSION_SETTLE_STEPS = 0.5
 
@@ -23,7 +24,7 @@ EXTRUSION_SETTLE_STEPS = 0.5
 class MotionExecutor(Node):
     """Shared action lifecycle for sampled motion and feed-forward extrusion."""
 
-    def initialize_execution(self, config, planner):
+    def initialize_execution(self, config, planner, *, extrusion_enabled=True):
         """Initialize execution after the concrete node has read its parameters."""
         self.config = config
         self.planner = planner
@@ -41,9 +42,13 @@ class MotionExecutor(Node):
         self.last_extrusion_update = None
         self.speed_publisher = None
         self.action = None
+        self.control_lock = None
         # Dry-run has no command publishers or action client, even on shutdown.
         if not self.config.dry_run:
-            self.speed_publisher = self.create_publisher(Float32, '/stepper/speed', 1)
+            self.control_lock = RobotControlLock()
+            self.control_lock.acquire()
+            if extrusion_enabled:
+                self.speed_publisher = self.create_publisher(Float32, '/stepper/speed', 1)
             self.action = ActionClient(
                 self, FollowJointTrajectory,
                 '/scaled_joint_trajectory_controller/follow_joint_trajectory',
@@ -51,6 +56,12 @@ class MotionExecutor(Node):
             self.create_subscription(
                 JointState, '/joint_states', self.on_joints, qos_profile_sensor_data,
             )
+
+    def destroy_node(self):
+        try:return super().destroy_node()
+        finally:
+            lock = getattr(self,'control_lock',None)
+            if lock is not None:lock.release()
 
     def on_joints(self, message):
         """Accept fresh, finite joint states and order them by joint name."""

@@ -18,23 +18,143 @@
       </div>
     </header>
     <nav class="tool-tabs" aria-label="Dashboard and connected tools">
-      <a id="dashboard-tab" class="tool-tab active" href="/" aria-current="page">Dashboard</a>
+      <a id="setup-tab" class="tool-tab active" href="#setup" aria-current="page">Setup &amp; calibration</a>
+      <a id="dashboard-tab" class="tool-tab" href="#dashboard">G-code dashboard</a>
       <a id="printer-ui-placeholder" class="tool-tab unavailable" href="#" aria-disabled="true">Fluidd / Mainsail</a>
       <a id="fluidd-link" class="tool-tab external" target="_blank" rel="noopener noreferrer" hidden>Fluidd</a>
       <a id="mainsail-link" class="tool-tab external" target="_blank" rel="noopener noreferrer" hidden>Mainsail</a>
       <a id="alps-link" class="tool-tab external" href="https://crispybuttermilkchickensalad.github.io/ALPS-logger/" target="_blank" rel="noopener noreferrer">ALPS Logger</a>
     </nav>
 
-    <main id="dashboard-view">
+    <main id="setup-view">
+      <section class="card" aria-label="Robot connection and manual startup">
+        <div class="card-heading"><h2>1. Connect the robot</h2><span id="robot-connection-badge" class="badge">Checking…</span></div>
+        <p class="muted">Start the PC-side UR driver here. Klipper starts on its own host and only needs the Ethernet connection to this PC.</p>
+        <div class="button-row"><button id="robot-connect" class="button primary" type="button" disabled>Connect robot</button><button id="setup-home-link" class="button secondary" type="button">Go to homing ↓</button></div>
+        <p id="robot-connection-message" class="inline-message" role="status"></p>
+        <h3>Complete arm startup manually</h3>
+        <ol><li>Use your existing UR controls to power the arm and release the brakes.</li><li>Select Remote Control, start the saved External Control program, and set the speed slider to 100%.</li><li>Check the installation, tool TCP and payload in your existing UR setup. The dashboard keeps those settings unchanged.</li></ol>
+        <p class="chart-caption">Power, brakes, mode selection, and program Load/Play are manual actions. Connect robot only launches the configured PC driver and checks feedback.</p>
+        <p id="robot-configuration" class="chart-caption"></p>
+        <ul id="robot-readiness" class="startup-checks"></ul>
+      </section>
+      <section class="card" aria-label="AxisForge nozzle TCP settings">
+        <div class="card-heading"><h2>Nozzle TCP offset</h2><span id="tcp-badge" class="badge">Loading…</span></div>
+        <p class="muted">Set the nozzle-tip translation from AxisForge’s tool0 frame in millimetres. These are tool-relative offsets, not positions in the robot’s Base frame. UR controller TCP, orientation and payload settings remain manual.</p>
+        <form id="tcp-form">
+          <fieldset id="tcp-fields" class="tcp-fields" disabled>
+            <legend>AxisForge nozzle offset (mm)</legend>
+            <div class="tcp-grid">
+              <label for="tcp-x">X (mm)<input id="tcp-x" type="number" step="any" min="-1000" max="1000" required></label>
+              <label for="tcp-y">Y (mm)<input id="tcp-y" type="number" step="any" min="-1000" max="1000" required></label>
+              <label for="tcp-z">Z (mm)<input id="tcp-z" type="number" step="any" min="-1000" max="1000" required></label>
+            </div>
+          </fieldset>
+          <p id="tcp-saved" class="chart-caption"></p>
+          <p id="tcp-effect" class="chart-caption">Edits apply only after Save. Saving updates printing, homing and ALPS calibration for their next run. It clears job preflight. A bed mesh made with a different TCP needs re-probing.</p>
+          <div class="button-row"><button id="tcp-save" class="button primary" type="submit" disabled>Save nozzle TCP</button><button id="tcp-reload" class="button secondary" type="button" disabled>Reload saved values</button></div>
+        </form>
+        <p id="tcp-message" class="inline-message" role="status"></p>
+        <p id="tcp-bed-mesh" class="chart-caption" role="status"></p>
+      </section>
+      <section class="card" aria-label="ALPS weighing scale calibration">
+        <div class="card-heading"><h2>2. ALPS load calibration</h2><span id="load-calibration-badge" class="badge">Not run</span></div>
+        <p class="muted">Move the arm to its home pose manually. Place a weighing scale on the buildplate beneath the upright nozzle. After confirmation, the arm finds contact slowly, lifts 5 mm, and waits for you to tare the scale.</p>
+        <div class="button-row"><button id="load-calibration-start" class="button primary" disabled>Start scale routine</button><button id="load-calibration-simulate" class="button secondary" disabled>Simulate scale routine</button><button id="load-calibration-abort" class="button danger" disabled>Stop calibration</button></div>
+        <p id="load-calibration-readiness" class="chart-caption"></p>
+        <p id="load-calibration-message" class="inline-message" role="status"></p>
+        <p id="load-calibration-sensor" class="chart-caption"></p>
+        <div id="load-calibration-confirmation" class="probe-confirmation" hidden><h3 id="load-calibration-confirm-title"></h3><p id="load-calibration-confirm-detail"></p><button id="load-calibration-confirm" class="button primary" disabled>Confirm</button></div>
+        <div id="load-calibration-steps" class="probe-confirmation" hidden>
+          <h3>Adjust the load with Z baby steps</h3>
+          <label for="load-step-size">Distance per click</label>
+          <select id="load-step-size"><option value="0.001">0.001 mm</option><option value="0.01" selected>0.01 mm</option><option value="0.05">0.05 mm</option><option value="0.5">0.5 mm — clearance only when descending</option></select>
+          <div class="button-row"><button id="load-step-up" class="button secondary" disabled>↑ Up — release load</button><button id="load-step-down" class="button secondary" disabled>↓ Down — apply load</button><button id="load-calibration-finish" class="button primary" disabled>Finish — scale unloaded</button></div>
+          <p id="load-calibration-position" class="chart-caption"></p>
+          <p>Use a small stable load shown on the scale as your first weight. Open ALPS Logger → Calibration and log that measured weight with its sensor reading. Adjust to a second distinct stable load and log it there too. Do not assume a target weight from uncalibrated counts.</p>
+          <p class="chart-caption">Use Up to unload the scale before finishing. Steps are limited to 0.25 mm below detected contact; an overload or lost feedback stops the routine. This page does not write Klipper calibration or change the bed map.</p>
+        </div>
+        <button id="calibration-open-logger" class="button secondary" type="button">Open ALPS Logger tab</button>
+      </section>
+      <section class="card bed-probe-card" aria-label="Bed homing and load-cell mesh">
+        <div class="card-heading">
+          <h2>3. Home &amp; probe bed</h2>
+          <span id="bed-probe-badge" class="badge">Checking…</span>
+        </div>
+        <p class="muted">Place the flat build surface beneath the upright nozzle. After your confirmation, the arm descends vertically, backs off, and probes again more slowly. It then moves to the first mesh point at 10 mm above its starting height and waits for your second confirmation.</p>
+        <p class="chart-caption">The routine measures all nine points, then returns to its starting nozzle position. Run it whenever the bed moves; an existing valid bed map can still be used. Starting this routine clears saved job preflight.</p>
+        <div class="button-row">
+          <button id="bed-probe-start" class="button primary" type="button" disabled>Home &amp; probe bed</button>
+          <button id="bed-probe-simulate" class="button secondary" type="button" disabled>Simulate routine</button>
+          <button id="bed-probe-abort" class="button danger" type="button" disabled>Stop probing</button>
+        </div>
+        <p id="bed-probe-readiness" class="chart-caption"></p>
+        <p id="bed-probe-message" class="inline-message" role="status">Checking the homing service…</p>
+        <p id="bed-probe-sensor" class="chart-caption"></p>
+        <div id="bed-probe-progress-container" class="preflight-progress" hidden>
+          <label for="bed-probe-progress" id="bed-probe-progress-label">Bed probe progress</label>
+          <progress id="bed-probe-progress" max="1" value="0"></progress>
+        </div>
+        <div id="bed-probe-confirmation" class="probe-confirmation" hidden>
+          <h3 id="bed-probe-confirm-title"></h3>
+          <p id="bed-probe-confirm-detail"></p>
+          <p id="bed-probe-position" class="chart-caption"></p>
+          <button id="bed-probe-confirm" class="button primary" type="button" disabled>Confirm</button>
+        </div>
+      </section>
+
+      <section class="card" aria-label="Job configuration"><h2>4. Job configuration</h2>
+        <p class="muted">Choose which heaters to check. Preflight heats only the selected heaters to their G-code targets, then switches all heaters off before checking the robot. Robot preflight does not move the arm.</p>
+        <fieldset id="heater-check-options" class="heater-check-options" aria-describedby="heater-options-note">
+          <legend>Preflight heater checks</legend>
+          <label class="check-row" for="check-extruder"><input id="check-extruder" type="checkbox" checked><span>Check extruder heater <small id="extruder-check-state">Detecting…</small></span></label>
+          <label class="check-row" for="check-bed"><input id="check-bed" type="checkbox" checked><span>Check bed heater <small id="bed-check-state">Detecting…</small></span></label>
+        </fieldset>
+        <p id="heater-options-note" class="chart-caption">Configured heaters still follow G-code at Start. If a heater is not configured and its check is off, its commands are ignored for this job. Off targets (0 °C) need no heat test.</p>
+        <fieldset id="motion-options" class="heater-check-options" aria-describedby="motion-options-note">
+          <legend>Corner motion</legend>
+          <label for="corner-policy">Planning policy</label>
+          <select id="corner-policy">
+            <option value="exact">Conservative — stop at corners</option>
+            <option value="klipper">Klipper — square corner velocity</option>
+            <option value="marlin">Marlin — junction deviation</option>
+            <option value="blend">Smooth geometric blend (recommended)</option>
+          </select>
+          <div id="corner-klipper" hidden><label for="corner-scv">90° corner speed (mm/s)</label><input id="corner-scv" type="number" min="0" max="20" step="any" value="1" required></div>
+          <div id="corner-marlin" hidden><label for="corner-jd">Junction deviation (mm)</label><input id="corner-jd" type="number" min="0" max="1" step="any" value="0.01" required></div>
+          <div id="corner-blend" hidden>
+            <label for="corner-tolerance">Maximum path deviation (mm)</label><input id="corner-tolerance" type="number" min="0" max="0.2" step="any" value="0.05" required>
+            <label for="corner-speed">Maximum blend speed (mm/s)</label><input id="corner-speed" type="number" min="0" max="20" step="any" value="5" required>
+          </div>
+        </fieldset>
+        <p id="motion-options-note" class="chart-caption">Choose a corner policy before preflight. Klipper pressure advance remains active in every mode.</p>
+        <fieldset id="clock-options" class="heater-check-options" aria-describedby="clock-options-note clock-speed-note" disabled>
+          <legend>Clock timing</legend>
+          <label for="clock-profile">Network / timing profile</label>
+          <select id="clock-profile"><option value="standard">Standard — 10 ms (default)</option></select>
+          <label for="clock-uncertainty">Maximum scheduling uncertainty (ms)</label>
+          <input id="clock-uncertainty" type="number" min="2" max="20" step="any" value="10" required readonly>
+          <label for="clock-alignment">Maximum running alignment error (ms)</label>
+          <input id="clock-alignment" type="number" min="2" max="20" step="any" value="10" required readonly>
+        </fieldset>
+        <p id="clock-options-note" class="chart-caption">Checking clock timing support…</p>
+        <p id="clock-speed-note" class="chart-caption"></p>
+        <p id="clock-measurement" class="chart-caption" role="status"></p>
+        <p id="heartbeat-measurement" class="chart-caption" role="status"></p>
+      </section>
+      <section class="card"><button id="setup-continue" class="button primary" type="button">Continue to G-code dashboard →</button></section>
+    </main>
+    <main id="dashboard-view" hidden>
       <section class="card workflow-card" aria-label="G-code execution workflow">
         <div class="workflow-title">
           <h2>G-code job pipeline</h2>
           <span id="sync-availability-badge" class="badge">Select a job</span>
         </div>
         <ol class="workflow-steps">
-          <li><span class="step-number">1</span><div><strong>Upload G-code</strong><p>Store the same file on both systems</p></div></li>
-          <li><span class="step-number">2</span><div><strong>Run preflight</strong><p id="step-klipper">Check heaters, then switch them off</p><p id="step-robot">Validate robot motion and timing</p></div></li>
-          <li><span class="step-number">3</span><div><strong>Start synchronized job</strong><p id="step-sync">Preflight required</p></div></li>
+          <li><span class="step-number">1</span><div><strong>Setup &amp; calibration</strong><p id="step-home">Locate the surface and measure its mesh</p></div></li>
+          <li><span class="step-number">2</span><div><strong>Upload G-code</strong><p>Store the same file on both systems</p></div></li>
+          <li><span class="step-number">3</span><div><strong>Run preflight</strong><p id="step-klipper">Check heaters, then switch them off</p><p id="step-robot">Validate robot motion and timing</p></div></li>
+          <li><span class="step-number">4</span><div><strong>Start synchronized job</strong><p id="step-sync">Preflight required</p></div></li>
         </ol>
         <p class="pipeline-note">Klipper sets the motion timeline. The robot must accept each timed chunk before Klipper queues its extrusion. Both systems stop at chunk boundaries and wait for completion.</p>
       </section>
@@ -58,13 +178,7 @@
         <label for="job-select">G-code file</label>
         <select id="job-select"><option value="">Loading jobs…</option></select>
         <div id="jobs-message" class="inline-message" role="status"></div>
-        <p class="muted">Choose which heaters to check. Preflight heats only the selected heaters to their G-code targets, then switches all heaters off before checking the robot. Robot preflight does not move the arm.</p>
-        <fieldset id="heater-check-options" class="heater-check-options" aria-describedby="heater-options-note">
-          <legend>Preflight heater checks</legend>
-          <label class="check-row" for="check-extruder"><input id="check-extruder" type="checkbox" checked><span>Check extruder heater <small id="extruder-check-state">Detecting…</small></span></label>
-          <label class="check-row" for="check-bed"><input id="check-bed" type="checkbox" checked><span>Check bed heater <small id="bed-check-state">Detecting…</small></span></label>
-        </fieldset>
-        <p id="heater-options-note" class="chart-caption">Configured heaters still follow G-code at Start. If a heater is not configured and its check is off, its commands are ignored for this job. Off targets (0 °C) need no heat test.</p>
+        <p class="muted">Set heater, motion and network options in Setup &amp; calibration, then run preflight for this file.</p>
         <div class="button-row">
           <button id="preflight-both" class="button primary" type="button" disabled>Run preflight</button>
         </div>
@@ -75,9 +189,10 @@
         </div>
         <ul id="preflight-checks" class="preflight-checks"></ul>
         <p id="preflight-message" class="inline-message" role="status"></p>
-        <p class="muted">Start reheats configured heaters and moves the arm. Keep the work area clear and the UR speed slider at 100%. Run preflight again after changing heater options. Results expire after 15 minutes or when the file or calibration changes.</p>
+        <p class="muted">Start reheats configured heaters and moves the arm. Keep the work area clear and the UR speed slider at 100%. Run preflight again after changing heater, corner or clock options. Results expire after 15 minutes or when the file or calibration changes.</p>
+        <p id="sync-start-status" class="inline-message" role="status">Checking start readiness…</p>
         <div class="button-row">
-          <button id="sync-start" class="button primary" type="button" disabled>Start synchronized job</button>
+          <button id="sync-start" class="button primary" type="button" aria-describedby="sync-start-status" disabled>Start synchronized job</button>
           <button id="sync-abort" class="button danger" type="button" disabled>Abort both</button>
         </div>
         <p id="sync-message" class="inline-message" role="status">Sync: idle</p>
@@ -173,16 +288,7 @@
 
       </section>
 
-      <section class="card safety-card">
-        <div class="emergency-panel">
-          <div>
-            <strong>Emergency stop both systems</strong>
-            <p>Requests stop on both systems. Keep physical E-stops accessible.</p>
-          </div>
-          <button id="klipper-estop" class="button danger">E-stop both</button>
-        </div>
-        <p id="safety-message" class="inline-message" role="status"></p>
-      </section>
+
     </main>
     <section id="embedded-view" class="embedded-view" aria-label="Connected tool" hidden>
       <div class="embedded-heading">
@@ -195,6 +301,16 @@
       </p>
       <div id="embedded-frames"></div>
     </section>
+      <section class="card safety-card">
+        <div class="emergency-panel">
+          <div>
+            <strong>Emergency stop both systems</strong>
+            <p>Requests stop on both systems. Keep physical E-stops accessible.</p>
+          </div>
+          <button id="klipper-estop" class="button danger">E-stop both</button>
+        </div>
+        <p id="safety-message" class="inline-message" role="status"></p>
+      </section>
     <footer>Keep the UR pendant and physical E-stop accessible.</footer>
     <script src="/static/app.js" defer></script>
   </body>

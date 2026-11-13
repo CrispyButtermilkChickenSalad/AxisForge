@@ -401,7 +401,7 @@ in `Klipper-AxisForge-Bridge/` before building the Docker image. This local work
 already contains that folder. Keep `.env` out of version control:
 
 ```ini
-MOONRAKER_URL=http://192.168.137.66:7125
+MOONRAKER_URL=http://192.168.0.96:7125
 ROBOT_IP=192.168.0.100
 AXISFORGE_SYNC_ENABLE=1
 ```
@@ -411,40 +411,72 @@ docker compose up -d --build dev
 docker compose exec dev axisforge-build
 docker compose --profile klipper up -d
 # Run the driver separately if it is not already running:
-docker compose exec dev bash -lc './scripts/ur_ros2_driver.sh'
+# Open http://localhost:8080 → Setup & calibration → Connect robot
+# Complete power/brake/External Control startup manually using your UR controls.
 ```
 
 Install the matching Klipper module on the **Klipper host**, following
 [Bridge setup](Klipper-AxisForge-Bridge/README.md#klipper-host). It requires
 `kinematics: none` and the current extra-axis/motion_queuing API. On this installation
-Moonraker is `192.168.137.66:7125`; the UR robot is the separate `192.168.0.100` host.
+Moonraker is `192.168.0.96:7125`; the UR robot is the separate `192.168.0.100` host.
+The AxisForge PC (`192.168.0.10/24`), robot and Klipper Ethernet port share the
+same switch. Klipper's persistent `AxisForge wired sync` network profile assigns
+`192.168.0.96/24` without changing the default route or DNS. Its Wi-Fi address
+`192.168.137.96` remains available for recovery; synchronization uses Ethernet.
 The worker binds to loopback port 8081 and the dashboard to port 8080.
+
+After changing the Klipper address, update `MOONRAKER_URL` and any explicit
+`MAINSAIL_URL`, `FLUIDD_URL` or `PRINTER_UI_URL` in `.env`. With the synchronized
+workflow and standalone AxisForge idle, apply the settings with
+`docker compose --profile klipper up -d --no-deps --force-recreate bridge`.
+A container restart alone does not reload Compose environment values. Confirm
+Klipper is connected in the dashboard and run a fresh preflight before Start.
 
 Open **http://127.0.0.1:8080**:
 
 1. **Upload to both**; the uploaded file is selected automatically.
-2. Select **Check extruder heater** and **Check bed heater** independently, then
-   **Run preflight**. Klipper verifies the file and generates the timeline. It
+2. Select **Check extruder heater** and **Check bed heater** independently. Choose
+   a **Corner motion** policy (Klipper SCV, Marlin JD, smooth geometric blend,
+   or conservative stops), then
+   choose **Clock timing** (default 10 ms; profiles include network and speed
+   guidance, plus custom limits). **Run preflight**. Klipper verifies the file and generates the timeline. It
    tests selected heaters at G-code targets, then switches all
    targets to zero before robot IK and timing checks. The robot does not move.
 3. Start the UR External Control program with speed scaling at **100%** and
-   NORMAL safety mode. Click **Start synchronized job** after both checks pass.
-   Start reheats, approaches the entry point and runs acknowledged timed chunks.
+   NORMAL safety mode. Select **Remote Control** on the pendant so the independent
+   dashboard Stop command is available. Click **Start synchronized job** after both checks pass.
+   Start reheats, approaches the entry point and executes prequeued timed runs.
 
 A heater that is not configured defaults to unchecked. Its G-code commands are
 ignored for that job with a warning, so an unheated bed can accept slicer files
 containing M140/M190. For configured heaters, disabling a preflight check skips
 only the test; Start still follows G-code temperatures. Off targets need no test.
-Rerun preflight after changing a heater option. Cold-extrusion limits remain active.
+Rerun preflight after changing heater, corner or clock options. Cold-extrusion limits remain active.
+Clock profiles use an illustrative 0.10 mm timing-displacement allowance for speed
+guidance; they do not change feed rates or certify a connection. See the
+[clock timing guide](Klipper-AxisForge-Bridge/docs/synchronized-jobs.md#clock-timing-profiles).
+Klipper heartbeat transport is independent of clock sampling. A guarded recovery
+window applies only to robot preflight with heater targets off; heating and motion
+retain strict supervision. Update the Bridge and Klipper module together for
+[cold-preflight heartbeat support](Klipper-AxisForge-Bridge/docs/synchronized-jobs.md#heartbeats-during-preflight-and-printing).
 
-Both systems must complete a chunk before the next begins. Missing heartbeats,
+Synchronized extrusion uses Klipper's native pressure advance and smoothing even
+with `kinematics:none`; the master retains the XY metadata needed for PA. The
+robot worker sends no extrusion or second PA correction. Standalone
+`pressure_advance_s` is not used for this workflow, and choosing Marlin JD does
+not switch to Marlin Linear Advance. A G-code `SET_PRESSURE_ADVANCE` value must
+match the Klipper host before preflight.
+
+Both systems must complete a run before the next begins. Missing heartbeats,
 stale feedback, timing faults or controller errors stop the job and turn heaters
 off. Aborting already queued extrusion shuts Klipper down; resolve the fault,
 restart Klipper and run preflight again. Mid-job resume is not supported.
 
-This first version stops at each G-code move and waits at chunk boundaries. It
-has automated protocol, planner and fault tests, but physical synchronization
-accuracy and printing quality still need commissioning. The local integration
+With `continuous_motion: True`, transport handoffs occur at G-code barriers
+instead of every two seconds. Corner policies share one master timeline and
+remain subject to actual joint interpolation checks. Smooth blending defaults to
+0.05 mm path deviation; tighter rounding can take longer. Physical synchronization
+accuracy, PA calibration and printing quality still need commissioning. The local integration
 check uploads a no-heat/no-extrusion file and validates it without starting motion.
 See [worker guide](docs/synchronized-jobs.md) and
 [Bridge protocol](Klipper-AxisForge-Bridge/docs/synchronized-jobs.md) for limits,
@@ -587,11 +619,13 @@ ros2 launch axisforge_bringup ur_master.launch.py \
 
 ### Bed probing
 
-The bed is movable: probe it again every time it is placed. With the UR driver running
-(Terminal 1), jog the nozzle onto a 3x3 grid (G-code X/Y = 30, 117.5, 205) and record each
-touch. Probing always uses an upright nozzle (roll 180°, pitch 0°), with the printing yaw
-and TCP from `ur_master.yaml`; each point starts `clearance_mm` above `z_offset`, and jogs
-stop 3 mm below it.
+The bed is movable: probe it again every time it is placed. For an ALPS load cell,
+use the dashboard's **Home & probe bed** step described below. Manual paper probing
+also remains available: with the UR driver running (Terminal 1), jog the nozzle onto
+a 3x3 grid (G-code X/Y = 30, 117.5, 205) and record each touch. Paper probing uses an
+upright nozzle (roll 180°, pitch 0°), with the printing yaw and TCP from
+`ur_master.yaml`; each point starts `clearance_mm` above `z_offset`, and jogs stop
+3 mm below it.
 
 ```bash
 cd /path/to/AxisForge   # bed_probe_file is relative to this directory
@@ -603,6 +637,165 @@ Keys: `w`/`s` Z up/down, `1`-`4` Z step 1/0.1/0.05/0.01 mm, `i`/`k` +Y/-Y and `j
 -X/+X in 10 mm steps (`--xy-step-mm`), space records (paper test; `--paper-mm` default 0.1
 is subtracted), `n`/`p` next/previous point, `h` lift, `q` lift, save and quit. Ctrl-C
 cancels the active trajectory. The result goes to `bed_probe_file` unless `--output` is given.
+
+#### Guided ALPS homing and mesh from the dashboard
+
+In **Setup & calibration**, the **Home & probe bed** card runs the homing and mesh routine
+inside Klipper–AxisForge Bridge. AxisForge moves the arm and records nozzle TCP
+height from fresh joint feedback; Klipper supplies ALPS samples. The bare nozzle
+is the contact probe, so no paper thickness or separate XY probe offset is used.
+Klipper `PROBE` and `BED_MESH_CALIBRATE` do not move the arm in this arrangement.
+
+Start the UR driver and External Control program, with Remote Control selected and
+the speed slider at 100%. Position the clean, cool nozzle **upright and unloaded**,
+clear of the flat build surface. Both heater targets must be zero and the nozzle
+must be below 50 °C. The routine checks the starting orientation and preserves it;
+it does not make an initial joint-space approach or automatically rotate the tool.
+Leave room for the subsequent lift and mesh travel before starting.
+
+1. Press **Home & probe bed**. Confirm that the flat build surface is beneath the
+   nozzle, and that the nozzle is clean, cool, clear of the surface and unloaded.
+   This confirmation establishes the session's unloaded sensor baseline.
+2. The arm descends in **Z only**, initially at **0.5 mm/s** in **0.05 mm** steps,
+   stopping on sustained load detection. Descent is bounded to **20 mm** below
+   the saved starting position; failure to find contact stops the routine.
+3. It retracts **3 mm**, verifies that the load clears, and probes again at
+   **0.1 mm/s** in **0.01 mm** steps. The slower contact establishes the bed height;
+   disagreement between the two contacts rejects the result.
+4. It lifts vertically to **10 mm above the original starting Z**, then moves in
+   XY to the existing first mesh point: G-code **X30 Y30** with the default grid,
+   transformed using the configured bed origin and nozzle TCP. The dashboard waits
+   for confirmation that this is the intended **front-leftmost mesh point**.
+5. After that confirmation, it automatically measures the nine-point serpentine
+   grid. Each point uses three contacts; the default accepted Z spread is **0.05 mm**.
+6. It lifts to a clear height, returns in XY, then moves in Z to the **saved starting
+   nozzle position and orientation**. This returns to the pose captured at the
+   beginning, not a separate pendant-defined Home pose.
+
+The active bed map is replaced only after the entire grid **and the return move**
+succeed. Partial results remain in `bed_probe.pending.yaml`; the previous map is
+backed up as `bed_probe.yaml.<timestamp>.bak`. The file records the homing contacts,
+repeated mesh readings, their units and the session baseline. Starting the routine
+clears saved job preflight: run **Run preflight** again before synchronized Start.
+An existing valid bed map can still be used when the bed has not moved.
+
+**Stop probing** cancels the active trajectory. A missing bridge heartbeat, closed
+control pipe, expired confirmation, stale samples, excessive noise, ADC saturation
+or errors, excessive signal excursion, heater activation, a competing job, or a
+failure to clear contact stops the routine. Abort and fault paths do not attempt
+an automatic return through an unverified scene. **Simulate routine** exercises the
+same confirmation flow with synthetic sensor and robot data; its separate output
+does not replace the active map or count as completed physical homing.
+
+The default native profile is
+[`bridge_bed_probe.yaml`](src/axisforge_bringup/config/bridge_bed_probe.yaml). It uses
+**raw ADC-count changes**, so grams calibration is not required: contact is a
+sustained absolute change of **20,000 counts** from the unloaded baseline, with a
+maximum excursion of **60,000 counts**. Both pressure polarities are accepted.
+The baseline belongs to this session; the routine does not change Klipper's
+`counts_per_gram`, reference tare, calibration flag or printer configuration.
+
+These numbers are configurable commissioning values. [Mellow's ALPS FAQ](https://mellow.klipper.cn/en/docs/ProductDoc/ExtensionBoard/fly-alps/faq/)
+uses `set 20000` as an example, not a factory default. The
+[Mellow configuration tool](https://mellow.klipper.cn/en/docs/ToolsDoc/fly-alps-tool/)
+reads the connected device's setting and displays `8000` as an example placeholder.
+Its onboard filtered signal is not established to be equivalent to the raw Klipper
+ADS131M02 stream, so neither example supplies a verified force limit for this arm.
+Check sensor response and tune the profile for the actual assembly. Counts are
+shown as counts, not grams. `contact_offset_mm` adds a measured correction for
+hotend/load-cell deflection; zero does not compensate contact-force deflection.
+The host/network feedback loop is not a hardware force limiter.
+
+The dashboard supervises the ROS entry point `ros2 run print_control bridge_bed_probe`
+with `--config` and the adjacent default profile; `--profile` selects another native
+profile. This entry point expects newline-delimited JSON commands on stdin,
+including heartbeats and stage/token confirmations, and emits `AXISFORGE_PROBE`
+status events. It is not a keyboard-interactive terminal script. Use the dashboard
+for normal operation rather than launching another instance beside it.
+
+#### Calibrated grams mode and terminal probing
+
+The existing terminal helper remains available with
+[`load_cell_bed_probe.yaml`](src/axisforge_bringup/config/load_cell_bed_probe.yaml).
+Its default **grams mode** requires a known-load calibration. The configured
+`counts_per_gram: 138` alone is not proof of calibration. With the robot stationary,
+the nozzle upright, cool and unloaded, and both heater targets off, use the Klipper
+console:
+
+1. Run `LOAD_CELL_CALIBRATE LOAD_CELL=load_cell_probe`.
+2. Remove external load from the nozzle and run `TARE`.
+3. Apply a known, measured load through the nozzle/load-cell load path, within the
+   assembly's rating. Run `CALIBRATE GRAMS=<actual known grams>` while the load is
+   steady. Enter the actual number, not the placeholder. This host's calibration
+   tool requires at least 50 g and checks that the ADC change is large enough.
+   Never use robot pressure against the bed as an unknown calibration load.
+4. Only after calibration succeeds, run `ACCEPT`, remove the load, then run
+   `SAVE_CONFIG`. This saves the scale/reference and restarts Klipper; wait for Ready.
+   If calibration fails, run `ABORT` and resolve it before trying again.
+
+The commands above match the installed Klipper module. See also
+[Klipper load-cell documentation](https://www.klipper3d.org/Load_Cell.html).
+Grams mode checks both `is_calibrated` and the reference/scale before creating a
+robot controller. Calibration should use the same orientation and hotend assembly
+as probing. Raw mode in the guided dashboard routine does not require this
+conversion to grams.
+
+From the AxisForge root, with the existing Docker `dev` service running:
+
+```bash
+# Read the real sensor, including before calibration; no robot connection/motion.
+./scripts/bed_probe_load_cell.sh --sensor-check
+
+# Exercise all nine points with a synthetic sensor and simulated robot.
+./scripts/bed_probe_load_cell.sh --dry-run --automatic \
+  --output /workspace/.docker/bed_probe.simulated.yaml
+
+# Calibrated grams mode: space/t probes a point; a scans all nine.
+./scripts/bed_probe_load_cell.sh
+
+# Alternatively, immediately start the entire physical probing sequence:
+./scripts/bed_probe_load_cell.sh --automatic
+```
+
+For physical terminal probing, start the UR driver's External Control program and
+position the upright nozzle in a clear approach area. Confirm `z_offset` and `clearance_mm`
+place the hover grid above the whole bed: the initial approach is a joint-space move.
+The existing X/Y origin, nozzle TCP, upright orientation and 3x3 grid remain in use.
+Keep the nozzle clean and below 50 °C, with heater targets at zero. Quit with `q`
+to lift, or Ctrl-C to cancel without a further move. Manual downward/XY jogging is
+disabled in load-cell mode. Original paper probing remains available with
+`ros2 run print_control bed_probe --mode paper ...`.
+
+The helper reads `MOONRAKER_URL` and optional `MOONRAKER_API_KEY` from the root `.env`
+or its process environment. The guided dashboard routine uses the bridge's configured
+Moonraker address. The ALPS bulk bridge must run on the same host, port **7126**
+(`--alps-url` or `ALPS_BRIDGE_URL` overrides it). For this wired installation those
+are `http://192.168.0.96:7125` and `http://192.168.0.96:7126`. The sensor-check command
+verifies the actual sample stream. There is no fallback to the logger's averaged
+Moonraker readings. On native ROS, run from the same workspace root and use
+`ros2 run print_control bed_probe --mode load-cell --config "$PWD/src/axisforge_bringup/config/ur_master.yaml"`.
+All controllers must share the same `AXISFORGE_ROBOT_LOCK` file; Docker sets this
+to `/workspace/.axisforge-robot-control.lock`. Restart `sync-worker` and `bridge`
+after upgrading, while idle, to load their probing-ownership checks.
+
+The terminal grams-mode defaults are an initial contact threshold **50 g**,
+maximum observed load **200 g**, **0.02 mm** steps at **0.2 mm/s**, **0.5 mm** retract,
+and three touches with at most **0.05 mm** Z spread.
+These are commissioning settings, not a measured load rating for the hotend. Verify
+the calibrated force response and assembly limits before the first physical probe.
+Detection cancels the current step, confirms action termination, checks sustained
+contact, records measured TCP position, and retracts before another touch. Loss of
+samples, ADC errors, overload, heater activation, a competing Klipper job, failure
+to clear contact, or failure to find the bed before `--floor-mm` stops the session.
+This host/network feedback loop is not a hardware force limiter; step size and
+speed bound the commanded contact motion, and latency/compliance still matter.
+
+The terminal helper also saves partial measurements to `bed_probe.pending.yaml`
+and promotes a complete nine-point map with a backup. It retains its original
+hover/approach workflow rather than the dashboard's two-confirmation homing and
+return sequence. Re-run synchronized preflight after changing the bed map. Dry
+runs write a separate file, and printing rejects simulated or explicitly incomplete
+maps.
 
 
 Configuration is in [`ur_master.yaml`](src/axisforge_bringup/config/ur_master.yaml):
@@ -630,3 +823,95 @@ Configuration is in [`ur_master.yaml`](src/axisforge_bringup/config/ur_master.ya
 | `pressure_advance_s` | Klipper `pressure_advance` K for depositing motions: the planned position is E + K * dE/dt. It cancels at the rest-to-rest end, so total E is exact; the extruder briefly reverses while decelerating. 0 keeps extrusion in sync with motion |
 | `extrusion_move_margin_s` | E-only moves (retract/unretract) are sent to `/stepper/move` as `[signed steps, steps/s]` and counted by the firmware; the node waits the move duration plus this margin so transport jitter cannot truncate it |
 | `ignored_commands` | Explicit list of externally managed commands; every encountered code is reported |
+
+### Dashboard startup and scale calibration
+
+Open <http://localhost:8080>. **Setup & calibration** is the first tab; the G-code
+upload/preflight/start workflow is in the next tab. Complete these steps:
+
+1. Press **Connect robot** to launch the existing PC-side UR driver. It detects an
+   existing ROS driver instead of launching a duplicate. Readiness checks show
+   Ethernet/joint feedback, Remote Control, arm state, External Control, speed
+   scaling, and the saved AxisForge nozzle offset. Power-on, brake release, mode
+   selection, program Load/Play, installation TCP and payload remain manual.
+2. For ALPS calibration, press **Start scale routine**. Manually move to a home
+   pose with an upright, clean, cool nozzle, then confirm. Place the weighing
+   scale on the buildplate below the nozzle with a small unloaded gap (≤20 mm),
+   then confirm separately. The routine descends along base Z at **0.1 mm/s** in
+   **0.01 mm** steps, stops on raw ALPS contact, and lifts **5 mm** at 0.5 mm/s.
+3. Tare the weighing scale and confirm. Use **Up / Down** for individual
+   0.001/0.01/0.05 mm steps; 0.5 mm descending steps are permitted only while
+   staying at least 0.5 mm above detected contact. Travel is bounded between the
+   retracted height and 0.25 mm below detected contact. Rotation and XY remain
+   fixed. Obtain two distinct, stable scale readings and enter each measured
+   weight in **ALPS Logger → Calibration** alongside its sensor reading. Return
+   to Setup to adjust the second load. Do not tare ALPS while loaded.
+4. Use **Up** to release the scale, then **Finish — scale unloaded**. Finish
+   holds the current pose and does not return home automatically. Remove the
+   scale, use **Home & probe bed**, choose job settings, then continue to the
+   G-code dashboard. Calibration/homing invalidate old job preflight results.
+
+The scale routine uses raw counts without declaring the sensor calibrated. Its
+contact threshold is `max(8000, ceil(4.1 × unloaded peak-to-peak noise))`, capped
+at 20000 counts; excess noise rejects the routine before movement. Five successive
+samples confirm contact and 60000 counts is the independent stop limit. See
+[`alps_load_calibration.yaml`](src/axisforge_bringup/config/alps_load_calibration.yaml).
+These are commissioning values, not a vendor factory default or known gram loads.
+Mellow's [tool](https://mellow.klipper.cn/en/docs/ToolsDoc/fly-alps-tool/) and
+[FAQ](https://mellow.klipper.cn/en/docs/ProductDoc/ExtensionBoard/fly-alps/faq/)
+describe threshold tuning; the onboard filtered signal differs from the raw
+Klipper ADC stream used here. The routine never writes ALPS/Klipper calibration
+or the bed map. Saving in the logger is a separate operator action; verify the
+calibration required by any later grams-based Klipper workflow independently.
+
+The existing sensor/robot watchdogs, heater-off checks, process lock and independent
+stop fallback apply to calibration. There is no queued jogging or automatic retry
+of motion. Abort stops without a return move. **Simulate scale routine** exercises
+the confirmations and synthetic contact without contacting either device.
+
+The `robot-connection` container supervises only the PC driver, separate from
+`bridge`, so refreshing/restarting the web dashboard does not shut down that driver.
+Its HTTP service binds to loopback port 8082. It starts passively at boot and only
+launches the UR driver after **Connect robot**; it never enables headless arm startup.
+The Docker daemon must start at boot. After the normal build, create the services:
+
+```bash
+docker compose --profile klipper up -d
+python3 scripts/open_dashboard.py --install
+```
+
+Containers use `restart: unless-stopped`; explicitly stopped containers remain
+stopped until started again. The installer adds **AxisForge Bridge** to the desktop
+application menu and opens the dashboard after desktop login (waiting up to 90 s
+for the local service). Remove `~/.config/autostart/axisforge-bridge.desktop` to
+turn off browser autostart. Klipper/Moonraker and its ALPS stream service run on the
+printer host independently; no PC-side SSH/startup script is required. Verify their
+host services after reconnecting Ethernet. Real nozzle/scale contact, the saved TCP,
+and safe physical travel require a supervised hardware commissioning run.
+
+### Edit the AxisForge nozzle TCP from the dashboard
+
+In **Setup & calibration → Nozzle TCP offset**, edit X, Y and Z in **millimetres**
+and press **Save nozzle TCP**. These describe the nozzle tip relative to the
+AxisForge model's **tool0** frame, not robot Base coordinates. Existing values are
+loaded from `gcode_interpreter.ros__parameters.tcp_offset_mm` in `AXISFORGE_CONFIG`
+(`src/axisforge_bringup/config/ur_master.yaml` in the Docker stack).
+
+Saving works with hardware offline and makes no robot command. Printing, homing,
+and ALPS scale calibration read the new values on their next run; no driver or
+worker restart is required. UR controller TCP, orientation, payload and installation
+settings remain manual. The editor accepts finite values from −1000 to +1000 mm
+per axis; these input limits do not establish a safe physical tool or workspace.
+
+The dashboard blocks saving during jobs, preflight, homing, load calibration and
+driver startup. The shared robot lock also protects controllers launched outside
+the dashboard. A successful change clears saved preflight. A bed mesh made with a
+different TCP is preserved but rejected by the planner: use **Home & probe bed**
+again before printing. The TCP card reports whether the mesh's TCP matches.
+
+The writer changes only the TCP list, preserves other YAML settings and comments,
+and atomically replaces the file. The previous full configuration is kept beside
+it as `ur_master.yaml.tcp-backup` (the latest change only). **Reload saved values**
+discards form edits. If another tab/editor changed the configuration, or the save
+response was lost, reload and review before saving again. YAML configurations with
+anchors/aliases must be made explicit before using this editor.

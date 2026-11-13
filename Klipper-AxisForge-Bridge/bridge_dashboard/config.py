@@ -45,6 +45,10 @@ class Settings:
     sync_klipper_delay_s: float = 10.0
     robot_sync_url: str = 'http://127.0.0.1:8081'
     heater_check_timeout_s: float = 300.0
+    robot_connection_url: str | None = None
+    robot_ip: str = '192.168.0.100'
+    robot_driver_script: Path | None = None
+    robot_calibration_file: Path | None = None
 
     @classmethod
     def from_env(cls):
@@ -76,4 +80,10 @@ class Settings:
             sync_klipper_delay_s=float(os.getenv("SYNC_KLIPPER_DELAY_S", "10")),
             robot_sync_url=os.getenv('AXISFORGE_SYNC_URL', 'http://127.0.0.1:8081'),
             heater_check_timeout_s=float(os.getenv('HEATER_CHECK_TIMEOUT_S','300')),
+            robot_connection_url=os.getenv('AXISFORGE_ROBOT_CONNECTION_URL') or None,
+            robot_ip=os.getenv('ROBOT_IP', '192.168.0.100'),
+            robot_driver_script=Path(os.environ['AXISFORGE_ROBOT_DRIVER_SCRIPT']).resolve()
+                if os.getenv('AXISFORGE_ROBOT_DRIVER_SCRIPT') else None,
+            robot_calibration_file=Path(os.environ['UR_CALIBRATION_FILE']).resolve()
+                if os.getenv('UR_CALIBRATION_FILE') else None,
         )

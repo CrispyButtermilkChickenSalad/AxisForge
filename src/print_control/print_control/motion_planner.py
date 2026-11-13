@@ -115,6 +115,16 @@ class MotionPlanner:
         # Match the installed ur_description UR16e limits, including elbow ±180°.
         for link, limit in zip(self.robot.links, np.deg2rad(config.joint_limits_deg)):
             link.qlim = [-limit, limit]
+        # DHRobot.ikine_LM rebuilds this chain on every call. The model and its
+        # limits are fixed for the life of a planner (one preflight).
+        self.kinematics = self.robot.ets()
+        self.joint_limits = self.robot.qlim
+        self.link_kinematics = []
+        chain = rtb.ET.SE3(self.robot.base.A)
+        for link in self.robot.links:
+            chain = chain * link.ets
+            self.link_kinematics.append(chain)
+        self.base_z = float(self.robot.base.t[2])
         self.rotation = SE3.RPY(config.nozzle_rpy_deg, unit='deg', order='zyx').R
         self.offset_m = np.asarray(config.tcp_offset_mm) / 1000.0
 
@@ -126,38 +136,49 @@ class MotionPlanner:
 
     def nozzle_position(self, joints):
         """Return the nozzle tip in Base coordinates (mm)."""
-        pose = self.robot.fkine(joints)
-        return 1000 * (pose.t + pose.R @ self.offset_m)
+        pose = self.kinematics.eval(joints)
+        return 1000 * (pose[:3, 3] + pose[:3, :3] @ self.offset_m)
 
     def check_joints(self, joints):
         """Check joint limits and the configured link-origin height threshold."""
         if np.shape(joints) != (6,) or not np.all(np.isfinite(joints)):
             raise ValueError('Invalid IK/joint state')
-        if np.any(joints < self.robot.qlim[0]) or np.any(joints > self.robot.qlim[1]):
+        if np.any(joints < self.joint_limits[0]) or np.any(joints > self.joint_limits[1]):
             raise ValueError('Joint position exceeds configured limits')
-        min_z_mm = min(float(t.t[2]) for t in self.robot.fkine_all(joints)) * 1000
+        # Evaluate the same DH link frames through RTB's compiled ETS path,
+        # avoiding thousands of short-lived SE3 objects during interpolation.
+        min_z_mm = min(self.base_z, *(chain.eval(joints)[2, 3]
+                                     for chain in self.link_kinematics)) * 1000
         if min_z_mm < self.config.min_link_z_mm:
             raise ValueError('A link origin is below min_link_z_mm')
 
-    def check_pose(self, joints, start, end, rotation=None):
+    def check_pose(self, joints, start, end, rotation=None, path_tolerance_mm=None):
         """Check tip distance to a segment and fixed orientation on the model."""
-        pose = self.robot.fkine(joints)
-        tip = 1000 * (pose.t + pose.R @ self.offset_m)
+        pose = self.kinematics.eval(joints)
+        tip = 1000 * (pose[:3, 3] + pose[:3, :3] @ self.offset_m)
         delta = end - start
         norm = float(delta @ delta)
         fraction = np.clip((tip - start) @ delta / norm, 0, 1) if norm else 0.0
         error = np.linalg.norm(tip - (start + fraction * delta))
         rotation = self.rotation if rotation is None else rotation
-        cosine = (np.trace(rotation.T @ pose.R) - 1) / 2
+        cosine = (np.trace(rotation.T @ pose[:3, :3]) - 1) / 2
         angle = math.degrees(math.acos(np.clip(cosine, -1, 1)))
-        if error > self.config.path_tolerance_mm:
+        tolerance=self.config.path_tolerance_mm if path_tolerance_mm is None else min(
+            self.config.path_tolerance_mm,path_tolerance_mm)
+        if error > tolerance:
             raise ValueError(f'TCP path error {error:.4f} mm exceeds path_tolerance_mm')
         if angle > self.config.orientation_tolerance_deg:
             raise ValueError(f'Orientation error {angle:.4f} deg exceeds tolerance')
 
     def solve(self, point, seed, rotation=None):
         """Solve a nozzle pose and choose joint revolutions near the seed."""
-        result = self.robot.ikine_LM(self.tool_pose(point, rotation), q0=seed, joint_limits=True)
+        target = self.tool_pose(point, rotation)
+        # RTB eagerly generates all random restart seeds, even when the supplied
+        # seed succeeds. Adjacent path points normally need only that first solve.
+        # Keep the original full search as a fallback, with identical tolerances.
+        result = self.kinematics.ikine_LM(target, q0=seed, joint_limits=True, slimit=1)
+        if not result.success:
+            result = self.kinematics.ikine_LM(target, q0=seed, joint_limits=True)
         if not result.success:
             raise ValueError(f'IK failed for nozzle XYZ {np.asarray(point).tolist()}')
         # Choose an equivalent revolution close to the previous joint solution.
@@ -167,7 +188,7 @@ class MotionPlanner:
         return joints
 
     def check_motion(self, motion, xyz=None, pose_at=None,
-                     timing_hint='reduce speed or increase approach_duration_s'):
+                     timing_hint='reduce speed or increase approach_duration_s',path_tolerance_mm=None):
         """Sample cubic geometry; also include each joint's velocity extrema."""
         cfg = self.config
         for index, dt in enumerate(np.diff(motion.times)):
@@ -206,4 +227,4 @@ class MotionPlanner:
                     self.check_pose(q, xyz[index], xyz[index + 1])
                 if pose_at is not None:
                     point, rotation = pose_at(index, fraction)
-                    self.check_pose(q, point, point, rotation)
+                    self.check_pose(q, point, point, rotation,path_tolerance_mm=path_tolerance_mm)

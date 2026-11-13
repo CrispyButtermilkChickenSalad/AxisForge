@@ -1,4 +1,4 @@
-# All three services use identical paths for colcon entry points and calibration.
+# Runtime services share paths for colcon entry points and calibration.
 x-axisforge-runtime: &axisforge-runtime
   image: axisforge-dev:latest
   build:
@@ -16,6 +16,7 @@ x-axisforge-runtime: &axisforge-runtime
     ROS_DOMAIN_ID: ${ROS_DOMAIN_ID:-0}
     ROS_LOCALHOST_ONLY: ${ROS_LOCALHOST_ONLY:-0}
     ROBOT_IP: ${ROBOT_IP:-192.168.0.100}
+    AXISFORGE_ROBOT_LOCK: /workspace/.axisforge-robot-control.lock
   volumes:
     - type: bind
       source: .
@@ -38,6 +39,8 @@ services:
       - rosbridge_websocket_launch.xml
       - address:=127.0.0.1
       - port:=${ROSBRIDGE_PORT:-9090}
+      - call_services_in_new_thread:=true
+      - default_call_service_timeout:=2.0
     healthcheck:
       test:
         - CMD
@@ -65,6 +68,25 @@ services:
       retries: 6
       start_period: 30s
 
+  # Passive until Connect robot is pressed; never powers or starts the arm program.
+  robot-connection:
+    <<: *axisforge-runtime
+    profiles: [klipper]
+    environment:
+      <<: *ros-environment
+      ROSBRIDGE_URL: ws://127.0.0.1:${ROSBRIDGE_PORT:-9090}
+      AXISFORGE_SYNC_URL: http://127.0.0.1:${AXISFORGE_SYNC_PORT:-8081}
+      AXISFORGE_CONFIG: /workspace/src/axisforge_bringup/config/ur_master.yaml
+      AXISFORGE_ROBOT_DRIVER_SCRIPT: /workspace/scripts/ur_ros2_driver.sh
+      UR_CALIBRATION_FILE: /workspace/src/axisforge_bringup/config/ur16e_calibration.yaml
+      AXISFORGE_ROBOT_CONNECTION_PORT: ${AXISFORGE_ROBOT_CONNECTION_PORT:-8082}
+    command: [bash, /workspace/docker/robot-connection.sh]
+    healthcheck:
+      test: [CMD, python3, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${AXISFORGE_ROBOT_CONNECTION_PORT:-8082}/health', timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+
   bridge:
     <<: *axisforge-runtime
     profiles: [klipper]
@@ -81,6 +103,7 @@ services:
       AXISFORGE_GCODE_ROOT: /workspace/src/print_control/gcode
       AXISFORGE_CONFIG: /workspace/src/axisforge_bringup/config/ur_master.yaml
       AXISFORGE_SYNC_URL: http://127.0.0.1:${AXISFORGE_SYNC_PORT:-8081}
+      AXISFORGE_ROBOT_CONNECTION_URL: http://127.0.0.1:${AXISFORGE_ROBOT_CONNECTION_PORT:-8082}
       HEATER_CHECK_TIMEOUT_S: ${HEATER_CHECK_TIMEOUT_S:-300}
       BRIDGE_PORT: ${BRIDGE_PORT:-8080}
       FLUIDD_URL: ${FLUIDD_URL:-}

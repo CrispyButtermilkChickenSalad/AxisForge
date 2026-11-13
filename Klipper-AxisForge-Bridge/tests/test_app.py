@@ -11,6 +11,7 @@ from bridge_dashboard.app import create_app
 from bridge_dashboard.axisforge import AxisForgeError
 from bridge_dashboard.config import Settings
 from bridge_dashboard.moonraker import MoonrakerError
+from bridge_dashboard.bed_probe import BedProbeError
 
 
 class FakeMoonraker:
@@ -91,12 +92,35 @@ class FakeAxisForge:
         return {"running": False, "job": None, "dry_run": None, "return_code": None}
 
 
+class FakeBedProbe:
+    def __init__(self):
+        self.active=False;self.started=[];self.confirmed=[];self.pending=None
+    def busy(self):return self.active
+    def status(self):
+        return {'state':'waiting_surface' if self.active else 'idle','busy':self.active,
+                'confirmation':self.pending,'configured':True}
+    async def start(self,*,dry_run=False):
+        if self.active:raise BedProbeError('already active')
+        self.started.append(dry_run);self.active=True
+        self.pending={'stage':'surface','token':'a'*24}
+        return self.status()
+    async def confirm(self,stage,token):
+        if self.pending!={'stage':stage,'token':token}:raise BedProbeError('stale confirmation')
+        self.confirmed.append((stage,token));self.pending=None
+        return self.status()
+    async def abort(self,reason='operator'):
+        self.active=False;self.pending=None
+        return self.status()
+    async def close(self):await self.abort()
+
+
 class DashboardApiTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.moonraker = FakeMoonraker()
         self.rosbridge = FakeRosBridge()
         self.axisforge = FakeAxisForge(Path(self.temp_dir.name))
+        self.bed_probe = FakeBedProbe()
         settings = Settings(
             moonraker_url="http://127.0.0.1:7125",
             moonraker_api_key=None,
@@ -116,6 +140,7 @@ class DashboardApiTests(unittest.TestCase):
             patch("bridge_dashboard.app.MoonrakerClient", return_value=self.moonraker),
             patch("bridge_dashboard.app.RosBridge", return_value=self.rosbridge),
             patch("bridge_dashboard.app.AxisForgeRunner", return_value=self.axisforge),
+            patch("bridge_dashboard.app.BedProbeRunner", return_value=self.bed_probe),
         ]
         for item in self.patches:
             item.start()
@@ -128,6 +153,42 @@ class DashboardApiTests(unittest.TestCase):
             item.stop()
         self.temp_dir.cleanup()
 
+    def test_calibration_blocks_every_motion_entry_and_connection(self):
+        routine=self.client.app.state.load_calibration
+        routine._active=True
+        for path,body in (('/api/bed-probe/start',{}),('/api/robot/connect',{}),
+                          ('/api/jobs/part.gcode/preflight/both',{}),
+                          ('/api/sync/start',{'job':'part.gcode'}),
+                          ('/api/axisforge/start',{'job':'part.gcode','dry_run':True})):
+            with self.subTest(path=path):
+                self.assertEqual(self.client.post(path,json=body).status_code,409)
+        self.assertEqual(self.client.post('/api/jobs/upload',files={'file':('part.gcode',b'G1 X1')}).status_code,409)
+        routine._active=False
+
+    def test_connection_launch_is_allowed_with_klipper_offline_but_not_during_jobs(self):
+        self.moonraker.state='disconnected'
+        connection=self.client.app.state.robot_connection
+        with patch.object(connection,'connect',new_callable=AsyncMock,return_value={'busy':True}) as connect:
+            self.assertEqual(self.client.post('/api/robot/connect').status_code,200)
+            connect.assert_awaited_once()
+            with patch('bridge_dashboard.app.Workflow.busy',return_value=True):
+                self.assertEqual(self.client.post('/api/robot/connect').status_code,409)
+            self.assertEqual(connect.await_count,1)
+
+    def test_scale_routes_reject_cross_routine_confirmation_and_invalid_moves(self):
+        routine=self.client.app.state.load_calibration
+        routine._active=True
+        routine._snapshot.update(state='waiting_tare',confirmation={'stage':'tare','token':'a'*24})
+        with patch.object(routine,'_send',new_callable=AsyncMock) as send:
+            self.assertEqual(self.client.post('/api/load-calibration/confirm',json={'stage':'surface','token':'a'*24}).status_code,422)
+            self.assertEqual(self.client.post('/api/load-calibration/confirm',json={'stage':'tare','token':'a'*24}).status_code,200)
+            self.assertEqual(self.client.post('/api/load-calibration/confirm',json={'stage':'tare','token':'a'*24}).status_code,409)
+            self.assertEqual(send.await_count,1)
+        for body in ({'command':'step','token':'a'*24,'delta_mm':1.},
+                     {'command':'power_on','token':'a'*24}):
+            self.assertEqual(self.client.post('/api/load-calibration/action',json=body).status_code,422)
+        routine._active=False
+
     def test_live_job_is_always_blocked(self):
         response = self.client.post(
             "/api/axisforge/start",
@@ -135,6 +196,80 @@ class DashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 409)
         self.assertEqual(self.axisforge.started, [])
+
+    def test_bed_probe_api_requires_explicit_matching_confirmation(self):
+        result=self.client.post('/api/bed-probe/start',json={'dry_run':False})
+        self.assertEqual(result.status_code,200)
+        self.assertEqual(result.json()['state'],'waiting_surface')
+        self.assertFalse(self.bed_probe.confirmed)
+        result=self.client.post('/api/bed-probe/confirm',json={'stage':'front_left','token':'a'*24})
+        self.assertEqual(result.status_code,409)
+        result=self.client.post('/api/bed-probe/confirm',json={'stage':'surface','token':'a'*24})
+        self.assertEqual(result.status_code,200)
+        self.assertEqual(self.bed_probe.confirmed,[('surface','a'*24)])
+        result=self.client.post('/api/bed-probe/confirm',json={'stage':'surface','token':'a'*24})
+        self.assertEqual(result.status_code,409)
+
+    def test_bed_probe_blocks_every_pipeline_entry(self):
+        self.bed_probe.active=True
+        requests=(('/api/jobs/part.gcode/preflight/both',{}),
+                  ('/api/sync/start',{'job':'part.gcode'}),
+                  ('/api/axisforge/start',{'job':'part.gcode','dry_run':True}))
+        for path,body in requests:
+            with self.subTest(path=path):
+                response=self.client.post(path,json=body)
+                self.assertEqual(response.status_code,409,response.text)
+                self.assertIn('Bed homing',response.json()['detail'])
+        result=self.client.post('/api/jobs/upload',files={'file':('part.gcode',b'G1 X1\n')})
+        self.assertEqual(result.status_code,409);self.assertFalse(self.moonraker.uploads)
+
+    def test_job_and_planning_ownership_block_probe_start(self):
+        with patch('bridge_dashboard.app.Workflow.busy',return_value=True):
+            result=self.client.post('/api/bed-probe/start',json={})
+        self.assertEqual(result.status_code,409)
+        for state in ({'running':True},{'planning_check_running':True}):
+            with patch.object(self.axisforge,'status',return_value=state):
+                result=self.client.post('/api/bed-probe/start',json={})
+            self.assertEqual(result.status_code,409)
+        self.assertFalse(self.bed_probe.started)
+
+    def test_probe_start_and_preflight_are_serialized_before_child_is_running(self):
+        import asyncio
+        from concurrent.futures import ThreadPoolExecutor
+        import threading
+        entered,release=threading.Event(),threading.Event()
+        original=self.bed_probe.start
+        async def starting(**kwargs):
+            entered.set();await asyncio.to_thread(release.wait,2.)
+            return await original(**kwargs)
+        with patch.object(self.bed_probe,'start',side_effect=starting), \
+                patch('bridge_dashboard.app.Workflow.preflight',new_callable=AsyncMock) as preflight, \
+                ThreadPoolExecutor(max_workers=2) as executor:
+            start=executor.submit(self.client.post,'/api/bed-probe/start',json={})
+            self.assertTrue(entered.wait(1.))
+            planning=executor.submit(self.client.post,'/api/jobs/part.gcode/preflight/both',json={})
+            release.set()
+            self.assertEqual(start.result().status_code,200)
+            self.assertEqual(planning.result().status_code,409)
+            preflight.assert_not_awaited()
+
+    def test_stop_and_emergency_routes_cancel_bed_probe(self):
+        for path in ('/api/axisforge/stop','/api/sync/abort','/api/bed-probe/abort'):
+            self.bed_probe.active=True
+            result=self.client.post(path)
+            self.assertEqual(result.status_code,200,result.text)
+            self.assertFalse(self.bed_probe.active)
+        self.bed_probe.active=True
+        result=self.client.post('/api/klipper/emergency-stop')
+        self.assertEqual(result.status_code,200,result.text)
+        self.assertFalse(self.bed_probe.active);self.assertTrue(self.moonraker.stopped)
+
+    def test_probe_options_are_strict_and_do_not_accept_arbitrary_commands(self):
+        for value in ({'dry_run':'false'},{'dry_run':0},{'command':'G28'}):
+            with self.subTest(value=value):
+                self.assertEqual(self.client.post('/api/bed-probe/start',json=value).status_code,422)
+        for value in ({'stage':'surface','token':'short'}, {'stage':'home','token':'a'*24}):
+            self.assertEqual(self.client.post('/api/bed-probe/confirm',json=value).status_code,422)
 
     def test_synchronized_start_requires_preflight_and_legacy_arm_is_rejected(self):
         for action in ("arm", "start"):
@@ -223,14 +358,14 @@ class DashboardApiTests(unittest.TestCase):
                    return_value={'state':'preflighting'}) as preflight:
             response=self.client.post('/api/jobs/part.gcode/preflight/both',json={'heater_checks':choices})
         self.assertEqual(response.status_code,200)
-        preflight.assert_awaited_once_with('part.gcode',choices)
+        preflight.assert_awaited_once_with('part.gcode',choices,None,None)
 
     def test_legacy_preflight_defaults_to_both_checks(self):
         with patch('bridge_dashboard.app.Workflow.preflight',new_callable=AsyncMock,
                    return_value={'state':'preflighting'}) as preflight:
             response=self.client.post('/api/jobs/part.gcode/preflight/both')
         self.assertEqual(response.status_code,200)
-        preflight.assert_awaited_once_with('part.gcode',{'extruder':True,'heater_bed':True})
+        preflight.assert_awaited_once_with('part.gcode',{'extruder':True,'heater_bed':True},None,None)
 
     def test_invalid_heater_options_are_rejected(self):
         for choices in ({'heater_bed':'false'},{'bed':False},{'extruder':0}):
@@ -244,7 +379,51 @@ class DashboardApiTests(unittest.TestCase):
                    return_value={'state':'starting'}) as start:
             response=self.client.post('/api/sync/start',json={'job':'part.gcode','heater_checks':choices})
         self.assertEqual(response.status_code,200)
-        start.assert_awaited_once_with('part.gcode',choices)
+        start.assert_awaited_once_with('part.gcode',choices,None,None)
+
+    def test_corner_options_pass_to_preflight_and_start(self):
+        from klipper_extras.axisforge_corners import options
+        chosen=options({'policy':'blend','blend_tolerance_mm':.04})
+        for method,path,body in (
+            ('preflight','/api/jobs/part.gcode/preflight/both',{'motion_options':chosen}),
+            ('start','/api/sync/start',{'job':'part.gcode','motion_options':chosen})):
+            with patch('bridge_dashboard.app.Workflow.'+method,new_callable=AsyncMock,
+                       return_value={'state':'ready'}) as call:
+                response=self.client.post(path,json=body)
+            self.assertEqual(response.status_code,200,response.text)
+            self.assertEqual(call.await_args.args[-2],chosen)
+
+    def test_invalid_corner_options_fail_before_workflow(self):
+        for value in ({'policy':'classic'},{'blend_tolerance_mm':True},
+                      {'blend_speed_mm_s':'5'},{'square_corner_velocity':21},
+                      {'junction_deviation_mm':-1},{'unknown':1}):
+            with self.subTest(value=value):
+                response=self.client.post('/api/jobs/part.gcode/preflight/both',json={'motion_options':value})
+                self.assertEqual(response.status_code,422,response.text)
+
+    def test_clock_limits_forwarded_to_preflight_and_start(self):
+        chosen={'max_uncertainty_ms':10.,'max_alignment_error_ms':15.}
+        for method,path,body in (
+            ('preflight','/api/jobs/part.gcode/preflight/both',{'clock_options':chosen}),
+            ('start','/api/sync/start',{'job':'part.gcode','clock_options':chosen})):
+            with patch('bridge_dashboard.app.Workflow.'+method,new_callable=AsyncMock,
+                       return_value={'state':'ready'}) as call:
+                response=self.client.post(path,json=body)
+            self.assertEqual(response.status_code,200,response.text)
+            self.assertEqual(call.await_args.args[-1],chosen)
+
+    def test_invalid_clock_limits_rejected_before_workflow(self):
+        for value in ({'max_uncertainty_ms':True},{'max_alignment_error_ms':'15'},
+                      {'max_alignment_error_ms':21},{'max_alignment_error_ms':5},
+                      {'max_uncertainty_ms':1},{'max_alignment_error_ms':None},{'unknown':1}):
+            for path in ('/api/jobs/part.gcode/preflight/both','/api/sync/start'):
+                with self.subTest(value=value,path=path):
+                    response=self.client.post(path,json={'clock_options':value,**({'job':'part.gcode'} if path.endswith('start') else {})})
+                    self.assertEqual(response.status_code,422,response.text)
+
+    def test_start_rejects_misspelled_clock_field(self):
+        response=self.client.post('/api/sync/start',json={'job':'part.gcode','clock_settings':{'max_alignment_error_ms':15}})
+        self.assertEqual(response.status_code,422)
 
 
 if __name__ == "__main__":

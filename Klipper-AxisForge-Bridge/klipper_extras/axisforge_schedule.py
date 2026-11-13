@@ -1,13 +1,16 @@
-"""Deterministic stop-to-stop Cartesian/rotary schedule owned by Klipper.
+"""Deterministic Cartesian/rotary schedule owned by Klipper.
 
 No ROS, networking, heating or motion side effects. Progress u is dimensionless;
-the same trapezoid drives XYZ, ABC and E. Chunk boundaries have zero velocity.
+the same trapezoid drives XYZ, ABC and E. Runs start and finish at rest;
+optional look-ahead carries velocity through compatible straight moves.
 """
 
 import hashlib
 import json
 import math
 import re
+
+from .axisforge_corners import options as corner_options, junction_limit, round_run
 
 PROTOCOL = 'axisforge.sync.v1'
 WORD = re.compile(r'([A-Za-z])\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))?')
@@ -25,8 +28,8 @@ def finite(value, name):
     return float(value)
 
 
-def profile(start, end, delta_e, feed, limits):
-    """Plan normalized progress using every participating axis' speed/accel limit."""
+def motion_limits(start, end, delta_e, feed, limits):
+    """Normalized speed/acceleration caps for every participating axis."""
     linear = math.dist(start[:3], end[:3])
     angular = max(abs(a-b) for a, b in zip(start[3:], end[3:]))
     speed_limits, accel_limits = [], []
@@ -44,6 +47,14 @@ def profile(start, end, delta_e, feed, limits):
     v, a = min(speed_limits), min(accel_limits)
     if v <= 0 or a <= 0:
         raise ValueError('Motion speed and acceleration must be positive')
+    return v, a
+
+
+def profile(start, end, delta_e, feed, limits):
+    """Plan normalized progress using every participating axis' speed/accel limit."""
+    caps = motion_limits(start, end, delta_e, feed, limits)
+    if caps is None: return None
+    v, a = caps
     v = min(v, math.sqrt(a))
     ramp = v / a
     cruise = max(0.0, (1.0 - v * ramp) / v)
@@ -54,18 +65,86 @@ def profile(start, end, delta_e, feed, limits):
             'cruise_s': cruise, 'duration_s': duration}
 
 
+def continuous_run(moves, limits, settings=None):
+    """Plan speeds through the selected junction policy on the supplied geometry.
+
+    Geometric rounding, when selected, happens before this pass. Rotary tangent
+    and extrusion-direction changes retain a zero-speed junction. The whole run
+    is submitted at once, up to an explicit G-code synchronization barrier.
+    """
+    settings=corner_options(settings)
+    lengths, tangents, kinds, caps, accelerations, ratios = [], [], [], [], [], []
+    for move in moves:
+        delta = [b-a for a,b in zip(move['start'],move['end'])]
+        linear = math.dist(move['start'][:3],move['end'][:3])
+        angular = max(abs(d) for d in delta[3:])
+        kind = 'linear' if linear > 1e-12 else 'angular' if angular > 1e-12 else 'extrusion'
+        length = linear if kind=='linear' else angular if kind=='angular' else abs(move['delta_e'])
+        v, a = motion_limits(move['start'],move['end'],move['delta_e'],move['_feed'],limits)
+        lengths.append(length)
+        tangents.append([d/length for d in delta])
+        kinds.append(kind)
+        caps.append(min(v*length,move.get('_curve_speed',math.inf)))
+        accelerations.append(min(a*length,.5*limits['linear_acceleration'])
+                             if move.get('blend_segment') else a*length)
+        ratios.append(move['delta_e']/length)
+    speeds = [0.]*(len(moves)+1)
+    for i in range(1,len(moves)):
+        same_direction = (kinds[i-1]==kinds[i] and all(
+            math.isclose(a,b,rel_tol=1e-9,abs_tol=1e-10)
+            for a,b in zip(tangents[i-1],tangents[i])))
+        sign = lambda value: (value>0)-(value<0)
+        if sign(ratios[i-1]) != sign(ratios[i]): continue
+        cap = min(caps[i-1],caps[i])
+        if not same_direction:
+            if kinds[i-1]!='linear' or kinds[i]!='linear': continue
+            # Rotary tangent changes require a stop; do not round orientation.
+            if any(abs(d)>1e-10 for d in tangents[i-1][3:]+tangents[i][3:]): continue
+            cosine=sum(a*b for a,b in zip(tangents[i-1][:3],tangents[i][:3]))
+            if settings['policy'] in ('klipper','marlin'):
+                cap=min(cap,junction_limit(cosine,lengths[i-1],lengths[i],
+                    accelerations[i-1],accelerations[i],settings,limits['linear_acceleration']))
+            elif settings['policy']=='blend' and (moves[i-1].get('blend_segment') or moves[i].get('blend_segment')):
+                pass  # Curvature caps were derived from the Bezier control hulls.
+            else: continue
+        # Match Klipper's extruder junction-rate limit for changing E/mm ratios.
+        delta_ratio = abs(ratios[i]-ratios[i-1])
+        if delta_ratio:
+            cap = min(cap,limits.get('extrusion_corner_velocity',0.)/delta_ratio)
+        speeds[i] = cap
+    for i in range(len(moves)-1,-1,-1):
+        speeds[i] = min(speeds[i],math.sqrt(speeds[i+1]**2+2*accelerations[i]*lengths[i]))
+    for i in range(len(moves)):
+        speeds[i+1] = min(speeds[i+1],math.sqrt(speeds[i]**2+2*accelerations[i]*lengths[i]))
+    elapsed = 0.
+    for i,move in enumerate(moves):
+        distance = lengths[i]
+        a, v0, v1 = accelerations[i]/distance, speeds[i]/distance, speeds[i+1]/distance
+        v = max(v0,v1,min(caps[i]/distance,math.sqrt(a+.5*(v0*v0+v1*v1))))
+        up, down = (v-v0)/a, (v-v1)/a
+        cruise = max(0.,(1.-.5*(v0+v)*up-.5*(v1+v)*down)/v)
+        duration = up+cruise+down
+        move['profile'] = {'acceleration':a,'velocity':v,'start_velocity':v0,
+                           'end_velocity':v1,'ramp_s':up,'decel_s':down,
+                           'cruise_s':cruise,'duration_s':duration}
+        move['offset_s'] = elapsed
+        elapsed += duration
+    return elapsed
+
+
 def progress(p, seconds):
     """Return u and du/dt; reject extrapolation outside the scheduled move."""
     t = finite(seconds, 'sample time')
     if t < -1e-9 or t > p['duration_s'] + 1e-9:
         raise ValueError('Sample outside move')
     t = max(0.0, min(t, p['duration_s']))
+    v0, v1 = p.get('start_velocity',0.), p.get('end_velocity',0.)
     if t <= p['ramp_s']:
-        return 0.5*p['acceleration']*t*t, p['acceleration']*t
+        return v0*t+0.5*p['acceleration']*t*t, v0+p['acceleration']*t
     if t <= p['ramp_s'] + p['cruise_s']:
-        return p['velocity']*(t - 0.5*p['ramp_s']), p['velocity']
+        return .5*(v0+p['velocity'])*p['ramp_s']+p['velocity']*(t-p['ramp_s']), p['velocity']
     remaining = p['duration_s'] - t
-    return 1 - 0.5*p['acceleration']*remaining*remaining, p['acceleration']*remaining
+    return 1-v1*remaining-0.5*p['acceleration']*remaining*remaining, v1+p['acceleration']*remaining
 
 
 def heater_check_options(value=None):
@@ -80,9 +159,16 @@ def heater_check_options(value=None):
     return checks
 
 
-def compile_job(text, limits, heaters, heater_checks=None):
+def compile_job(text, limits, heaters, heater_checks=None, motion_options=None):
     """Parse the supported printer dialect; unknown commands never execute implicitly."""
     checks = heater_check_options(heater_checks)
+    continuous = limits.get('continuous_motion',False)
+    settings=corner_options(motion_options)
+    if settings['policy']!='exact' and not continuous:
+        raise ValueError('Enable continuous_motion in [axisforge_sync] for corner policies')
+    if type(continuous) is not bool: raise ValueError('continuous_motion must be a boolean')
+    if continuous and finite(limits.get('extrusion_corner_velocity',0.),'extrusion_corner_velocity') < 0:
+        raise ValueError('extrusion_corner_velocity must be nonnegative')
     for key in ('linear_velocity', 'linear_acceleration', 'angular_velocity',
                 'angular_acceleration', 'extrusion_velocity', 'extrusion_acceleration'):
         if finite(limits.get(key), key) <= 0:
@@ -99,6 +185,15 @@ def compile_job(text, limits, heaters, heater_checks=None):
     def flush():
         nonlocal pending, pending_duration, sequence
         if pending:
+            if settings['policy']=='blend': pending=round_run(pending,settings,limits)
+            if len(pending)>MAX_OPERATIONS: raise ValueError('Rounded run exceeds operation limit; add M400')
+            for move in pending:
+                length=math.dist(move['start'][:3],move['end'][:3])
+                if length and move['delta_e']/length>limits['max_extrude_ratio']:
+                    raise ValueError('G-code line %d: rounded extrusion exceeds configured cross-section' % move['source_line'])
+            if continuous: pending_duration = continuous_run(pending,limits,settings)
+            for move in pending:
+                move.pop('_feed',None); move.pop('_curve_speed',None)
             operations.append({'kind': 'chunk', 'index': sequence,
                                'moves': pending, 'duration_s': pending_duration})
             pending, pending_duration = [], 0.
@@ -250,10 +345,10 @@ def compile_job(text, limits, heaters, heater_checks=None):
                 if p:
                     pending.append({'start':start, 'end':end, 'e_start':resolved_e,
                                     'delta_e':delta_e, 'profile':p, 'source_line':number,
-                                    'offset_s':pending_duration})
+                                    'offset_s':pending_duration, '_feed':move_feed*speed_factor})
                     resolved_e += delta_e
                     pending_duration += p['duration_s']
-                    if pending_duration >= limits.get('chunk_seconds', 2.0): flush()
+                    if not continuous and pending_duration >= limits.get('chunk_seconds', 2.0): flush()
             if len(operations)+len(pending) > MAX_OPERATIONS:
                 raise ValueError('Job exceeds operation limit')
         except (ValueError, OverflowError) as error:
@@ -262,6 +357,8 @@ def compile_job(text, limits, heaters, heater_checks=None):
     if entry is None or not any(op['kind']=='chunk' for op in operations):
         raise ValueError('Job needs an XY entry position and at least one subsequent move')
     plan = {'protocol':PROTOCOL, 'coordinate_frame':'gcode_bed',
+            'motion_mode':'continuous_runs' if continuous else 'stop_to_stop',
+            'motion_options':settings,
             'entry':entry, 'operations':operations,
             'heater_targets':peaks, 'warnings':warnings,
             'requested_heater_targets':requested_peaks, 'heater_checks':checks,

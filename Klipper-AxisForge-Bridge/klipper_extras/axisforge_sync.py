@@ -9,8 +9,13 @@ import inspect
 import math
 from pathlib import Path
 import secrets
+import threading
 
 from .axisforge_schedule import PROTOCOL, compile_job, digest
+from .axisforge_corners import options as corner_options, POLICIES
+
+HEARTBEAT_PROTOCOL = 2
+COLD_PREFLIGHT_LEASE_S = 3.
 
 
 class ScheduledExtrusion:
@@ -25,9 +30,9 @@ class ScheduledExtrusion:
         self.start_pos = record['start'][:3] + [record['e_start']+e_origin]
         self.end_pos = record['end'][:3] + [record['e_start']+record['delta_e']+e_origin]
         self.move_d = distance
-        self.start_v, self.cruise_v = 0., p['velocity']*distance
+        self.start_v, self.cruise_v = p.get('start_velocity',0.)*distance, p['velocity']*distance
         self.accel = p['acceleration']*distance
-        self.accel_t = self.decel_t = p['ramp_s']
+        self.accel_t, self.decel_t = p['ramp_s'], p.get('decel_s',p['ramp_s'])
         self.cruise_t = p['cruise_s']
 
     def limit_speed(self, speed, accel):
@@ -45,12 +50,20 @@ class AxisForgeSync:
         self.angular_v = config.getfloat('max_angular_velocity', 10., above=0.)
         self.angular_a = config.getfloat('max_angular_accel', 20., above=0.)
         self.chunk_seconds = config.getfloat('chunk_seconds', 2., minval=.1, maxval=10.)
+        self.continuous_motion = config.getboolean('continuous_motion', False)
+        self.motion_defaults=corner_options({'policy':config.get('corner_policy','exact'),
+            **{key:config.getfloat(key,default,minval=0.,maxval=maximum) for key,default,maximum in (
+                ('square_corner_velocity',1.,20.),('junction_deviation_mm',.01,1.),
+                ('blend_tolerance_mm',.05,.2),('blend_speed_mm_s',5.,20.))}})
         self.lease_s = config.getfloat('watchdog_seconds', 1., minval=.3, maxval=2.)
         self.lead_s = config.getfloat('start_lead_seconds', 1., minval=.5, maxval=5.)
         self.max_heat_s = config.getfloat('heater_timeout_seconds', 300., minval=10., maxval=900.)
         self.session = self.plan = self.reservation = None
         self.state, self.error = 'idle', ''
         self.leased = False
+        self.lease_mode = 'strict'
+        self.preparing = False
+        self.generation = 0
         self.deadline = self.heat_deadline = 0.
         self.next_chunk = 0
         self.e_origin = 0.
@@ -62,7 +75,7 @@ class AxisForgeSync:
         self.job = self.file_hash = None
         self.print_started = False
         hooks = self.printer.lookup_object('webhooks')
-        for name in ('capabilities', 'clock', 'prepare', 'acquire', 'heartbeat',
+        for name in ('capabilities', 'clock', 'prepare', 'acquire', 'heartbeat', 'lease_mode',
                      'heat', 'heaters_off', 'fan', 'reserve', 'commit', 'ack',
                      'release', 'complete', 'abort', 'status'):
             hooks.register_endpoint('axisforge_sync/'+name, getattr(self, 'api_'+name))
@@ -102,7 +115,7 @@ class AxisForgeSync:
             original = gcode.register_command(name, None)
             if original is not None:
                 def guarded(gcmd, handler=original):
-                    if self.leased:
+                    if self.leased or self.preparing:
                         raise gcmd.error('AxisForge owns this job; abort it before manual changes')
                     return handler(gcmd)
                 gcode.register_command(name, guarded)
@@ -148,10 +161,31 @@ class AxisForgeSync:
             heater.set_temp(0.)
         self.heat_deadline = 0.
 
+    def _lease_seconds(self):
+        return COLD_PREFLIGHT_LEASE_S if self.lease_mode == 'cold_preflight' else self.lease_s
+
+    def _cold_preflight_safe(self):
+        now = self.reactor.monotonic()
+        return (self.state == 'prepared' and not self.print_started and not self.preparing
+                and self.reservation is None and self.next_chunk == 0
+                and not self.printer.lookup_object('virtual_sdcard').is_active()
+                and all(heater.get_temp(now)[1] == 0 for heater in self.heaters.values()))
+
+    def _strict_control(self, request):
+        if self.lease_mode != 'strict':
+            raise request.error('Cold preflight forbids heater/fan/motion commands; restore strict control first')
+
+    def _heartbeat_ack(self):
+        # No sensor reads, configuration hashing, MCU clock conversion or disk I/O.
+        return {'state':self.state, 'session':self.session, 'leased':self.leased,
+                'lease_mode':self.lease_mode, 'watchdog_seconds':self._lease_seconds()}
+
     def _abort(self, reason):
+        self.generation += 1
         committed = self.reservation is not None and self.reservation.get('committed', False)
         self._off()
         self.leased, self.state, self.error = False, 'fault', reason
+        self.lease_mode = 'strict'
         self.reservation = None
         if self.print_started:
             self.print_started = False
@@ -163,15 +197,19 @@ class AxisForgeSync:
             self.printer.invoke_shutdown('AxisForge synchronized job aborted: '+reason)
 
     def _shutdown(self):
+        self.generation += 1
         self.leased, self.state, self.error = False, 'fault', 'Klipper shutdown'
+        self.lease_mode = 'strict'
 
     def _restart(self, *args):
-        if self.leased:
+        if self.leased or self.preparing:
             self._abort('Klipper restart requested')
 
     def _watchdog(self, eventtime):
         if self.leased and eventtime >= self.deadline:
             self._abort('Bridge heartbeat lost')
+        elif self.leased and self.lease_mode == 'cold_preflight' and not self._cold_preflight_safe():
+            self._abort('Cold preflight invariant violated')
         elif self.leased and self.heat_deadline and eventtime >= self.heat_deadline:
             self._abort('Heater operation timed out')
         return eventtime + .05
@@ -188,6 +226,8 @@ class AxisForgeSync:
                         for name, heater in self.heaters.items()}
         return {'protocol':PROTOCOL, 'state':self.state, 'error':self.error,
                 'session':self.session, 'job':self.job, 'leased':self.leased,
+                'lease_mode':self.lease_mode, 'watchdog_seconds':self._lease_seconds(),
+                'preparing':self.preparing,
                 'plan_hash':None if self.plan is None else self.plan['plan_hash'],
                 'machine_config':self._fingerprint(), 'next_chunk':self.next_chunk,
                 'temperatures':temperatures, 'reservation':self.reservation,
@@ -201,10 +241,16 @@ class AxisForgeSync:
 
     def api_capabilities(self, request):
         request.send({'protocol':PROTOCOL, 'control_ready':self._compatible(),
+                      'heartbeat_protocol':HEARTBEAT_PROTOCOL,
+                      'cold_preflight_watchdog_seconds':COLD_PREFLIGHT_LEASE_S,
                       'heater_check_options':True,
+                      'corner_policies':list(POLICIES) if self.continuous_motion else ['exact'],
+                      'motion_defaults':self.motion_defaults,
+                      'pressure_advance':self.extruder.get_status(self.reactor.monotonic()).get('pressure_advance',0.) if self.extruder else None,
                       'machine_config':self._fingerprint(), 'heaters':self.heater_config,
                       'watchdog_seconds':self.lease_s, 'start_lead_seconds':self.lead_s,
-                      'execution':'acknowledged_stop_to_stop_chunks'})
+                      'execution':('preplanned_continuous_runs' if self.continuous_motion else
+                                   'acknowledged_stop_to_stop_chunks')})
 
     def api_clock(self, request):
         if not self.mcu: raise request.error('Klipper is not ready')
@@ -213,6 +259,7 @@ class AxisForgeSync:
     def api_prepare(self, request):
         if not self._compatible():
             raise request.error('axisforge_sync unavailable: enable module, kinematics:none and supported Klipper')
+        if self.preparing: raise request.error('A motion plan is already being prepared')
         if self.leased or self.reservation:
             raise request.error('A job already owns the motion/heater lease')
         sd = self.printer.lookup_object('virtual_sdcard')
@@ -242,15 +289,36 @@ class AxisForgeSync:
                   'max_extrude_distance':self.extruder.max_e_dist,
                   'min_extrude_temp':self.extruder.heater.min_extrude_temp,
                   'pressure_advance':self.extruder.get_status(self.reactor.monotonic()).get('pressure_advance', 0.),
-                  'chunk_seconds':self.chunk_seconds}
+                  'chunk_seconds':self.chunk_seconds,
+                  'continuous_motion':self.continuous_motion,
+                  'extrusion_corner_velocity':getattr(self.extruder,'instant_corner_v',0.)}
+        try: text=content.decode('utf-8')
+        except UnicodeError as error: raise request.error(str(error))
+        heater_checks=request.get_dict('heater_checks',{})
+        motion_options=request.get_dict('motion_options',self.motion_defaults)
+        fingerprint,generation=self._fingerprint(),self.generation
+        completion=self.reactor.completion()
+        # Only pure planning runs off-thread. Yield the reactor while waiting so
+        # temperature handling, clock queries and shutdown remain responsive.
+        # Concurrent prepare/acquire/manual motion are blocked until it finishes.
+        def build():
+            try: result=(compile_job(text,limits,self.heater_config,heater_checks,motion_options),None)
+            except Exception as error: result=(None,error)
+            self.reactor.async_complete(completion,result)
+        self.preparing=True
         try:
-            plan = compile_job(content.decode('utf-8'), limits, self.heater_config,
-                               request.get_dict('heater_checks', {}))
+            threading.Thread(target=build,daemon=True).start()
+            plan,error=completion.wait()
+            if error is not None: raise error
+            if generation!=self.generation: raise ValueError('Printer state changed during preparation')
+            if fingerprint!=self._fingerprint(): raise ValueError('Klipper settings changed during preparation; retry preflight')
             if (any(op['kind']=='fan' and op['speed'] for op in plan['operations'])
                     and self.printer.lookup_object('fan', None) is None):
                 raise ValueError('G-code requests a primary fan, but none is configured')
         except (ValueError, UnicodeError) as error:
             raise request.error(str(error))
+        finally:
+            self.preparing=False
         self.plan, self.job, self.file_hash = plan, name, file_hash
         self.prepared_fingerprint = self._fingerprint()
         self.session = secrets.token_hex(24)
@@ -260,6 +328,7 @@ class AxisForgeSync:
                       'machine_config':self.prepared_fingerprint})
 
     def api_acquire(self, request):
+        if self.preparing: raise request.error('A motion plan is still being prepared')
         self._require(request, lease=False)
         if self.leased: raise request.error('Session is already acquired')
         if self.state != 'prepared' or self.next_chunk:
@@ -273,6 +342,7 @@ class AxisForgeSync:
         if hashlib.sha256((self.sdroot/self.job).read_bytes()).hexdigest() != self.file_hash:
             raise request.error('Job changed since preflight')
         self.leased = True
+        self.lease_mode = 'strict'
         self.e_origin = self.extruder.last_position
         if request.get('run',False):
             self.print_started = True
@@ -285,11 +355,32 @@ class AxisForgeSync:
 
     def api_heartbeat(self, request):
         self._require(request)
-        self.deadline = self.reactor.monotonic()+self.lease_s
-        request.send(self._status())
+        self.deadline = self.reactor.monotonic()+self._lease_seconds()
+        request.send(self._heartbeat_ack())
+
+    def api_lease_mode(self, request):
+        self._require(request)
+        mode = request.get('mode')
+        if mode not in ('strict', 'cold_preflight'):
+            raise request.error('Invalid heartbeat lease mode')
+        # Both transitions are preflight-only, before a job has started. The
+        # existing ownership guard remains in force throughout the cold phase.
+        if not self._cold_preflight_safe():
+            raise request.error('Lease transitions require cold, non-actuating preflight')
+        if self.toolhead.get_last_move_time() > self._clock()['print_time'] + .5:
+            raise request.error('Klipper motion queue is busy')
+        if mode == 'strict':
+            if self._fingerprint() != self.prepared_fingerprint:
+                raise request.error('Klipper settings changed during preflight')
+            if hashlib.sha256((self.sdroot/self.job).read_bytes()).hexdigest() != self.file_hash:
+                raise request.error('Job changed during preflight')
+        self.lease_mode = mode
+        self.deadline = self.reactor.monotonic()+self._lease_seconds()
+        request.send(self._heartbeat_ack())
 
     def api_heat(self, request):
         self._require(request)
+        self._strict_control(request)
         if self.reservation: raise request.error('Cannot change heaters during a motion chunk')
         targets = request.get_dict('targets')
         for name, target in targets.items():
@@ -311,6 +402,7 @@ class AxisForgeSync:
 
     def api_fan(self, request):
         self._require(request)
+        self._strict_control(request)
         if self.reservation: raise request.error('Fan changes require a chunk boundary')
         speed = request.get_float('speed')
         if not 0 <= speed <= 1: raise request.error('Fan speed must be 0..1')
@@ -321,6 +413,7 @@ class AxisForgeSync:
 
     def api_reserve(self, request):
         self._require(request)
+        self._strict_control(request)
         index = request.get_int('index')
         if self.reservation or index != self.next_chunk:
             raise request.error('Unexpected chunk or previous chunk not acknowledged')
@@ -342,6 +435,7 @@ class AxisForgeSync:
 
     def api_commit(self, request):
         self._require(request)
+        self._strict_control(request)
         reservation = self.reservation
         if not reservation or request.get('token') != reservation['token'] or reservation['committed']:
             raise request.error('Invalid or already committed reservation')
@@ -358,6 +452,8 @@ class AxisForgeSync:
                     move = ScheduledExtrusion(record, self.e_origin)
                     self.extruder.check_move(move, 3)
                     self.extruder.process_move(reservation['start_print_time']+record['offset_s'], move, 3)
+            if reservation['start_print_time']-self._clock()['print_time'] < .25:
+                raise ValueError('Prequeue missed the commit deadline')
             self.mq.note_mcu_movequeue_activity(reservation['end_print_time'])
             self.toolhead._advance_move_time(reservation['end_print_time'])
         except Exception as error:
@@ -391,6 +487,7 @@ class AxisForgeSync:
         if self.reservation: raise request.error('Cannot release a pending motion chunk')
         self._off()
         self.leased = False
+        self.lease_mode = 'strict'
         request.send(self._status())
 
     def api_complete(self, request):
@@ -400,6 +497,7 @@ class AxisForgeSync:
             raise request.error('Not all motion chunks were acknowledged')
         self._off()
         self.leased, self.state = False, 'complete'
+        self.lease_mode = 'strict'
         self.print_started = False
         stats=self.printer.lookup_object('print_stats',None)
         if stats is not None: stats.note_complete()

@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 
 import websockets
 
@@ -87,6 +88,29 @@ class RosBridge:
             "joint_state_age_s": round(age, 2) if age is not None else None,
             "joint_names": self._joint_names,
         }
+
+    async def call_service(self, service, service_type, args=None, timeout=1.5):
+        """Internal service RPC; service names are never accepted from web clients."""
+        if not self._connected or self._socket is None:
+            raise RuntimeError('ROS bridge is not connected')
+        request_id = 'robot-check-'+uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self._service_requests[request_id] = future
+        try:
+            async with self._send_lock:
+                await self._socket.send(json.dumps({'op':'call_service','id':request_id,
+                    'service':service,'type':service_type,'args':args or {}, 'timeout':timeout}))
+            # Bound the server's service call as well as our local wait. Otherwise
+            # an unavailable dashboard service can block later RPCs indefinitely.
+            response = await asyncio.wait_for(future, timeout+.5)
+            if not response.get('result'):
+                raise RuntimeError('ROS service unavailable: '+service)
+            values = response.get('values', {})
+            if not isinstance(values, dict) or values.get('success') is False:
+                raise RuntimeError('Robot did not answer '+service)
+            return values
+        finally:
+            self._service_requests.pop(request_id, None)
 
     async def request_axisforge_stop(self):
         if not self._connected or self._socket is None:

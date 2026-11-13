@@ -15,6 +15,7 @@ import signal
 import sys
 import termios
 import tty
+import math
 
 from ament_index_python.packages import get_package_share_directory
 import numpy as np
@@ -78,9 +79,14 @@ def rounded(values, digits=4):
 class BedProbe(MotionExecutor):
     """Keyboard jogging with an upright nozzle; records nozzle touch points."""
 
+    help_text = HELP
+
     def __init__(self, settings, motion_config, args):
         """Plan with the printing planner; dry runs simulate the robot."""
         super().__init__('bed_probe')
+        if not all(math.isfinite(v) for v in (args.margin_mm, args.paper_mm, args.floor_mm,
+                                             args.jog_speed, args.xy_step_mm)):
+            raise ValueError('Probe distances and speeds must be finite')
         if args.margin_mm <= 0 or 2 * args.margin_mm >= min(settings.bed_size_mm):
             raise ValueError('margin_mm must leave a positive grid inside bed_size_mm')
         if (args.paper_mm < 0 or args.floor_mm <= 0 or args.jog_speed <= 0 or
@@ -89,11 +95,17 @@ class BedProbe(MotionExecutor):
         # Write where gcode_interpreter reads; never plan on the surface being replaced.
         self.output = Path(args.output or settings.bed_probe_file or 'bed_probe.yaml')
         self.output = self.output.expanduser().resolve()
+        if motion_config.dry_run:
+            active = Path(settings.bed_probe_file or 'bed_probe.yaml').expanduser().resolve()
+            if args.output is None:
+                self.output = self.output.with_name('bed_probe.simulated.yaml')
+            elif self.output == active:
+                raise ValueError('Dry runs cannot replace the configured bed map; use another --output')
         self.settings = replace(settings, bed_probe_file='', nozzle_roll_deg=180.0,
-                                nozzle_pitch_deg=0.0)
+                                nozzle_pitch_deg=0.0, lookahead_enabled=False)
         self.args = args
         planner = GCodePlanner(self.settings, motion_config)
-        self.initialize_execution(planner.config, planner)
+        self.initialize_execution(planner.config, planner, extrusion_enabled=False)
         self.points = grid_points(settings.bed_size_mm, args.margin_mm)
         self.records = {}
         self.index = 0
@@ -206,14 +218,15 @@ class BedProbe(MotionExecutor):
         print(f'Recorded point {self.index + 1}: bed Z {self.records[self.index]["bed_z_mm"]:.3f}'
               f' mm (nozzle {nozzle[2]:.3f} - paper {self.args.paper_mm:g}) -> {self.output}')
 
-    def save(self):
-        """Write atomically so an interrupted session keeps every recorded point."""
+    def measurement_data(self):
+        """Common bed-map schema for paper and load-cell measurements."""
         cfg = self.settings
-        data = {
+        return {
             'description': 'Nozzle tip touching the bed through paper; robot Base frame, mm',
             'stamp': datetime.now().isoformat(timespec='seconds'),
             'config': str(Path(self.args.config).resolve()),
             'paper_thickness_mm': self.args.paper_mm,
+            'simulated': self.config.dry_run,
             'nozzle_rpy_deg': rounded(self.planner.config.nozzle_rpy_deg, 3),
             'tcp_offset_mm': rounded(self.planner.config.tcp_offset_mm, 3),
             'transform': {
@@ -223,6 +236,10 @@ class BedProbe(MotionExecutor):
             },
             'points': [self.records[index] for index in sorted(self.records)],
         }
+
+    def save(self):
+        """Write atomically so an interrupted session keeps every recorded point."""
+        data = self.measurement_data()
         temporary = self.output.with_name(self.output.name + '.tmp')
         temporary.write_text(yaml.safe_dump(data, sort_keys=False))
         temporary.replace(self.output)
@@ -242,7 +259,7 @@ class BedProbe(MotionExecutor):
         elif key == 'h':
             self.lift()
         elif key == '?':
-            print(HELP)
+            print(self.help_text)
         elif key == 'q':
             self.lift()
             if self.records:
@@ -276,7 +293,7 @@ class BedProbe(MotionExecutor):
 
     def run(self, stream=sys.stdin):
         """Approach point 1, then process keys until q or an interruption."""
-        print(HELP)
+        print(self.help_text)
         print(f'Output: {self.output}')
         if not self.config.dry_run:
             self.wait_until(self.action.server_is_ready, self.config.startup_timeout_s,
@@ -318,7 +335,7 @@ def parse_args(argv):
     parser.add_argument('--output', help='result YAML (default: bed_probe_file from --config)')
     parser.add_argument('--margin-mm', dest='margin_mm', type=float, default=30.0,
                         help='grid distance from the bed edges')
-    parser.add_argument('--paper-mm', dest='paper_mm', type=float, default=0.1,
+    parser.add_argument('--paper-mm', dest='paper_mm', type=float, default=None,
                         help='paper thickness subtracted from the nozzle Z')
     parser.add_argument('--floor-mm', dest='floor_mm', type=float, default=3.0,
                         help='deepest jog below the configured bed height (z_offset)')
@@ -327,19 +344,43 @@ def parse_args(argv):
     parser.add_argument('--xy-step-mm', dest='xy_step_mm', type=float, default=10.0,
                         help='X/Y jog step; moves at max_travel_speed_mm_s')
     parser.add_argument('--dry-run', action='store_true', help='simulate; no robot commands')
-    return parser.parse_args(argv)
+    parser.add_argument('--mode', choices=('paper', 'load-cell'), default='paper')
+    parser.add_argument('--sensor-config', help='load-cell probe settings YAML')
+    parser.add_argument('--moonraker-url', help='defaults to MOONRAKER_URL from environment or .env')
+    parser.add_argument('--alps-url', help='defaults to the Moonraker host on port 7126')
+    parser.add_argument('--load-cell', default='load_cell_probe', help='Klipper load-cell object name')
+    parser.add_argument('--sensor-check', action='store_true', help='read ALPS samples; never create a robot controller')
+    parser.add_argument('--automatic', action='store_true', help='probe the complete load-cell grid without keyboard input')
+    args = parser.parse_args(argv)
+    if args.sensor_check: args.mode = 'load-cell'
+    if args.paper_mm is None: args.paper_mm = 0. if args.mode == 'load-cell' else .1
+    if args.mode == 'load-cell' and args.paper_mm != 0:
+        parser.error('Load-cell probing uses the bare nozzle; --paper-mm must be zero')
+    if args.automatic and args.mode != 'load-cell': parser.error('--automatic requires --mode load-cell')
+    if args.sensor_check and args.dry_run: parser.error('--sensor-check reads hardware; omit --dry-run')
+    return args
 
 
 def main(argv=None):
     """Cancel any active trajectory before shutting down ROS."""
     args = parse_args(remove_ros_args(sys.argv if argv is None else argv)[1:])
     settings, motion = load_configs(args.config, args.dry_run)
-    rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
     node = None
+    source = None
     handlers = {}
     exit_code = 0
     try:
-        node = BedProbe(settings, motion, args)
+        probe_class, options = BedProbe, None
+        if args.mode == 'load-cell':
+            from print_control.load_cell_bed_probe import LoadCellBedProbe, sensor_setup, sensor_check
+            options, source = sensor_setup(args)
+            if args.sensor_check:
+                sensor_check(source)
+                return
+            probe_class = LoadCellBedProbe
+        rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
+        node = (probe_class(settings, motion, args, source, options) if options is not None
+                else probe_class(settings, motion, args))
 
         def interrupt(signum, frame):
             node.stop_requested = True
@@ -359,6 +400,8 @@ def main(argv=None):
                 node.destroy_node()
             if rclpy.ok():
                 rclpy.shutdown()
+            if source is not None:
+                source.close()
             for signum, handler in handlers.items():
                 signal.signal(signum, handler)
     if exit_code:
