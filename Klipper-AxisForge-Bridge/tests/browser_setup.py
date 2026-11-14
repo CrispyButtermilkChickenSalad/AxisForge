@@ -36,7 +36,7 @@ def main():
                     drop_confirmation=False;handler.abort();return
                 stage=data['stage'];next_stage={'home':'scale','scale':'tare'}.get(stage)
                 if next_stage:load.update(state='waiting_'+next_stage,confirmation=dict(stage=next_stage,token=next_stage[0]*32),message='Confirm '+next_stage)
-                else:load.update(state='adjusting_load',confirmation=None,action_token='x'*32,position_mm=[1,2,105.],lower_z_mm=99.75,upper_z_mm=105.,delta_counts=0.,trigger_value=8000.,max_value=60000.)
+                else:load.update(state='adjusting_load',confirmation=None,action_token='x'*32,position_mm=[1,2,105.],contact_z_mm=100.,lower_z_mm=99.75,upper_z_mm=125.,delta_counts=0.,trigger_value=8000.,max_value=60000.)
                 result=load
             elif path=='/api/load-calibration/action':
                 generation+=1;load.update(action_token=str(generation)*32)

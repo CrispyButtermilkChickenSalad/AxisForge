@@ -1,6 +1,8 @@
 """Tests for read-only Klipper toolhead telemetry."""
 
 import unittest
+import tempfile
+from pathlib import Path
 
 import httpx
 
@@ -62,6 +64,29 @@ class MoonrakerTelemetryTests(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.client.close()
+
+    async def test_upload_rejects_remote_name_conflict_without_posting_or_printing(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)/'job.gcode'; path.write_text('G1 X1\n')
+            with self.assertRaisesRegex(MoonrakerError,'already uses this version'):
+                await self.client.upload_gcode(path.name,path)
+        self.assertEqual([r.method for r in self.requests],['GET'])
+
+    async def test_upload_uses_same_version_name_and_does_not_request_print_start(self):
+        requests = []
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(404 if request.method == 'GET' else 201,json={'result':{}})
+        await self.client._client.aclose()
+        self.client._client = httpx.AsyncClient(base_url='http://printer',transport=httpx.MockTransport(respond))
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)/'part--123456abcdef.gcode'; path.write_bytes(b'G1 X1\n')
+            await self.client.upload_gcode(path.name,path)
+        self.assertEqual([r.url.path for r in requests],['/server/files/metadata','/server/files/upload'])
+        body = requests[-1].content
+        self.assertIn(b'part--123456abcdef.gcode',body)
+        self.assertIn(b'G1 X1\n',body)
+        self.assertNotIn(b'name="print"',body)
 
     async def test_discovers_telemetry_and_limits_history_without_commands(self):
         result = await self.client.telemetry()

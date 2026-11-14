@@ -22,10 +22,15 @@ let loadCalibrationAvailable = false, loadCalibrationInFlight = false, setupRefr
 let robotConnectionSnapshot = {busy:false}, robotConnectInFlight = false;
 let tcpSnapshot = null, tcpAvailable = false, tcpSaveInFlight = false, tcpRefreshInFlight = false;
 let tcpDirty = false, tcpConflict = false, tcpRequestVersion = 0;
+let probingSnapshot = null, probingAvailable = false, probingSaveInFlight = false, probingRefreshInFlight = false;
+let probingDirty = false, probingConflict = false, probingRequestVersion = 0;
+let bedSettingsSnapshot = null, bedSettingsAvailable = false, bedSettingsSaveInFlight = false, bedSettingsRefreshInFlight = false;
+let bedSettingsDirty = false, bedSettingsConflict = false, bedSettingsRequestVersion = 0;
+let jobTransferInFlight = false;
 let setupRequestVersion = 0;
 let calibrationVisibleToken = null, calibrationReadyAt = 0, uncertainCalibrationToken = null;
 const consumedCalibrationTokens = new Set();
-function setupBusy() { return tcpSaveInFlight || loadCalibrationSnapshot.busy || loadCalibrationInFlight || robotConnectionSnapshot.busy || robotConnectInFlight; }
+function setupBusy() { return tcpSaveInFlight || probingSaveInFlight || bedSettingsSaveInFlight || jobTransferInFlight || loadCalibrationSnapshot.busy || loadCalibrationInFlight || robotConnectionSnapshot.busy || robotConnectInFlight; }
 
 let bedProbeSnapshot = {state:"idle", busy:false, confirmation:null};
 let bedProbeAvailable = false;
@@ -616,6 +621,7 @@ for (const id of ["check-extruder", "check-bed"]) {
 }
 
 function syncStartBlocker(job, preflightReady) {
+  if (bedSettingsDirty || bedSettingsConflict) return "Save or reload the bed dimensions before preflighting or starting a job.";
   if (setupBusy()) return "Finish setup or scale calibration before starting a job.";
   if (bedProbeSnapshot.busy || bedProbeActionInFlight) return "Finish or stop bed homing/probing before starting a job.";
   if (syncActionInFlight) return "Waiting for the dashboard request to finish.";
@@ -651,7 +657,8 @@ function updateSyncControls() {
   byId("clock-options").disabled = busy || syncActionInFlight || !clockOptionsInitialized;
   byId("job-select").disabled = busy || syncActionInFlight;
   byId("upload-job").disabled = busy || syncActionInFlight;
-  byId("preflight-both").disabled = busy || syncActionInFlight || !heaterOptionsInitialized || !motionOptionsInitialized || !motionOptionsValid() || !clockOptionsInitialized || !clockOptionsValid() || !job || !latestSystemsReady || !latestAxisForgeIdle || !syncSnapshot.control_ready;
+  byId("copy-job-klipper").disabled = busy || syncActionInFlight || !job || !latestAxisForgeIdle;
+  byId("preflight-both").disabled = busy || syncActionInFlight || bedSettingsDirty || bedSettingsConflict || !heaterOptionsInitialized || !motionOptionsInitialized || !motionOptionsValid() || !clockOptionsInitialized || !clockOptionsValid() || !job || !latestSystemsReady || !latestAxisForgeIdle || !syncSnapshot.control_ready;
   byId("sync-start").disabled = Boolean(blocker);
   byId("sync-abort").disabled = !busy;
   byId("start-job").disabled = busy || !job || !latestSystemsReady || !latestAxisForgeIdle;
@@ -672,10 +679,12 @@ function updateBedProbeControls() {
   const liveReason = !bedProbeAvailable ? "Bed-probe service is unavailable." :
     !body.configured ? "Configure AxisForge before homing." :
     occupied ? "Finish or stop the current operation before starting another routine." :
+    bedSettingsDirty || bedSettingsConflict ? "Save or reload the bed dimensions before starting the routine." :
+    probingDirty || probingConflict ? "Save or reload the homing settings before starting the routine." :
     !latestSystemsReady ? latestSystemsReason :
     !syncSnapshot.robot_ready ? (syncSnapshot.robot_reason || "Check the robot connection and External Control program.") : "";
   byId("bed-probe-start").disabled = Boolean(liveReason);
-  byId("bed-probe-simulate").disabled = !bedProbeAvailable || !body.configured || occupied;
+  byId("bed-probe-simulate").disabled = !bedProbeAvailable || !body.configured || occupied || probingDirty || probingConflict || bedSettingsDirty || bedSettingsConflict;
   byId("bed-probe-abort").disabled = !busy || bedProbeActionInFlight;
   byId("bed-probe-readiness").textContent = busy ? "Heater targets must stay off. Stop probing cancels motion without returning the arm." :
     liveReason || "Ready. The first click checks readiness; motion waits for your confirmation below.";
@@ -692,7 +701,8 @@ function updateBedProbeControls() {
     `${body.trigger_mode === "raw" ? "Raw sensor mode" : "Calibrated sensor mode"}: ${threshold.toLocaleString()} ${unit} contact threshold${Number.isFinite(maximum) ? ` · ${maximum.toLocaleString()} ${unit} stop threshold` : ""}${body.trigger_mode === "raw" ? ". Uses the unloaded starting baseline; no conversion to grams." : "."}` : "";
   byId("bed-probe-progress-container").hidden = !busy && body.state !== "complete";
   byId("bed-probe-progress").value = body.progress || 0;
-  byId("bed-probe-progress-label").textContent = `${label} · ${body.current_point || 0}/${body.total_points || 9} mesh points`;
+  const plannedPoints = body.total_points || (probingSnapshot ? probingSnapshot.settings.mesh_columns * probingSnapshot.settings.mesh_rows : "—");
+  byId("bed-probe-progress-label").textContent = `${label} · ${body.current_point || 0}/${plannedPoints} mesh points`;
   const confirm = body.confirmation;
   const requested = busy && confirm && !consumedProbeConfirmations.has(confirm.token) && ["surface","front_left"].includes(confirm.stage);
   if (requested && visibleProbeConfirmation !== confirm.token) {
@@ -707,7 +717,7 @@ function updateBedProbeControls() {
     byId("bed-probe-confirm-title").textContent = first ? "Confirm the surface before descending" : "Confirm the front-left mesh point";
     byId("bed-probe-confirm-detail").textContent = `${body.dry_run ? "This is a simulation; no hardware will move. " : ""}${first ?
       "Confirm the flat build surface is underneath the upright nozzle. The nozzle must be clean, cool, clear of the surface and unloaded. Keep the area clear; confirmation starts a vertical descent." :
-      "Confirm the nozzle is above the intended first mesh point and this is the front-leftmost position of the mesh. Confirmation starts the automatic nine-point scan."}`;
+      "Confirm the nozzle is above the intended first mesh point and this is the front-leftmost position of the mesh. Confirmation starts the selected mesh scan."}`;
     byId("bed-probe-confirm").textContent = first ? "Surface confirmed — begin Z homing" : "Front-left confirmed — probe mesh";
     const position = body.position_mm;
     const grid = body.first_point;
@@ -888,10 +898,11 @@ window.setInterval(refreshSync, 1000);
 
 byId("upload-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (byId("upload-job").disabled || jobTransferInFlight) return;
   const file = byId("gcode-upload").files[0];
   if (!file) return showMessage("upload-message", "Choose a .gcode file.", true);
-  const button = byId("upload-job");
-  button.disabled = true;
+  jobTransferInFlight = true;
+  updateSyncControls();
   showMessage("upload-message", "Uploading to Moonraker and staging for AxisForge…");
   const form = new FormData();
   form.append("file", file);
@@ -900,13 +911,35 @@ byId("upload-form").addEventListener("submit", async (event) => {
     const body = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(body.detail || `Upload failed (${response.status})`);
     byId("gcode-upload").value = "";
-    showMessage("upload-message", `${body.job} uploaded. Run the Klipper and robot preflights before starting.`);
+    showMessage("upload-message", `${body.original_name} saved as ${body.job}. ${body.message}`);
     await loadJobs();
     byId("job-select").value = body.job;
     await loadPreflight();
   } catch (error) {
     showMessage("upload-message", error.message, true);
   } finally {
+    jobTransferInFlight = false;
+    updateSyncControls();
+  }
+});
+
+byId("copy-job-klipper").addEventListener("click", async () => {
+  if (byId("copy-job-klipper").disabled || jobTransferInFlight) return;
+  const job = byId("job-select").value;
+  jobTransferInFlight = true;
+  updateSyncControls();
+  showMessage("copy-job-message", "Copying the selected file under a new version name on both hosts…");
+  try {
+    const body = await request("/api/jobs/copy-to-klipper", {method:"POST", body:JSON.stringify({job})});
+    showMessage("copy-job-message", `${body.job}: ${body.message}`);
+    selectedPreflightState = null;
+    await loadJobs();
+    byId("job-select").value = body.job;
+    await loadPreflight();
+  } catch (error) {
+    showMessage("copy-job-message", error.message, true);
+  } finally {
+    jobTransferInFlight = false;
     updateSyncControls();
   }
 });
@@ -947,6 +980,8 @@ window.addEventListener("resize", drawTemperatureHistory);
 
 function updateSetupControls() {
   updateTcpControls();
+  updateProbingControls();
+  updateBedGeometryControls();
   const c = robotConnectionSnapshot, load = loadCalibrationSnapshot;
   const otherBusy = syncSnapshot.busy || bedProbeSnapshot.busy || bedProbeActionInFlight || syncActionInFlight || !latestAxisForgeIdle;
   byId("robot-connect").disabled = !c.available || !c.configured || Boolean(otherBusy || setupBusy());
@@ -954,6 +989,9 @@ function updateSetupControls() {
   setBadge("robot-connection-badge", c.ready ? "Ready" : (c.state || "Checking"), c.ready ? true : undefined);
   const cfg = c.configuration;
   byId("robot-configuration").textContent = cfg ? `Robot: ${cfg.robot_type} at ${cfg.robot_ip} · AxisForge nozzle offset: ${cfg.axisforge_tcp_mm?.join(", ") || "unavailable"} mm · These saved values still need to match the installed tool.` : "";
+  byId("robot-orientation").textContent = Array.isArray(cfg?.probing_rpy_deg) && cfg.probing_rpy_deg.length === 3 ?
+    `Saved AxisForge orientation at A/B/C = 0: roll ${cfg.probing_rpy_deg[0]}°, pitch ${cfg.probing_rpy_deg[1]}°, yaw ${cfg.probing_rpy_deg[2]}° in Base.` :
+    "Saved AxisForge orientation is unavailable; check the robot configuration before setting the initial pose.";
   byId("robot-readiness").replaceChildren(...(c.checks || []).map(check => {
     const item = document.createElement("li");
     item.textContent = `${check.status === "pass" ? "✓" : "○"} ${check.name}: ${check.detail}`;
@@ -987,8 +1025,26 @@ function updateSetupControls() {
   }
   byId("load-calibration-steps").hidden = !load.busy || !["adjusting_load","stepping","step_rejected"].includes(load.state);
   const enabled = loadCalibrationAvailable && load.busy && !loadCalibrationInFlight && load.state === "adjusting_load" && load.action_token && !consumedCalibrationTokens.has(load.action_token);
-  for (const id of ["load-step-up","load-step-down","load-calibration-finish"]) byId(id).disabled = !enabled;
+  const step = Number(byId("load-step-size").value);
+  const upReason = calibrationStepReason(step), downReason = calibrationStepReason(-step);
+  byId("load-step-size").disabled = !enabled;
+  byId("load-step-up").disabled = !enabled || Boolean(upReason);
+  byId("load-step-down").disabled = !enabled || Boolean(downReason);
+  byId("load-calibration-finish").disabled = !enabled;
+  byId("load-step-guidance").textContent = [upReason && `Up: ${upReason}`, downReason && `Down: ${downReason}`].filter(Boolean).join(" ") ||
+    "Both directions are available within the current travel limits. Use 0.05 mm or finer near contact.";
   byId("load-calibration-position").textContent = Array.isArray(load.position_mm) ? `Nozzle Z: ${load.position_mm[2].toFixed(3)} mm · Allowed Z: ${load.lower_z_mm?.toFixed(3)} to ${load.upper_z_mm?.toFixed(3)} mm · Raw delta: ${load.delta_counts?.toFixed(0) || "—"} counts` : "";
+}
+
+function calibrationStepReason(delta) {
+  const load = loadCalibrationSnapshot;
+  const z = load.position_mm?.[2];
+  if (![z, load.lower_z_mm, load.upper_z_mm, load.contact_z_mm].every(Number.isFinite)) return "Waiting for contact and travel limits.";
+  if (![.001, .01, .05, .1, .5, 1, 10].includes(Math.abs(delta))) return "Choose a supported step size.";
+  const end = z + delta;
+  if (end < load.lower_z_mm - 1e-8 || end > load.upper_z_mm + 1e-8) return "This step exceeds the allowed Z range; choose a smaller step.";
+  if (delta < -.05 && end < load.contact_z_mm + .5 - 1e-8) return "Use 0.05 mm or finer within 0.5 mm of contact.";
+  return "";
 }
 
 async function refreshSetup() {
@@ -1047,9 +1103,11 @@ byId("load-calibration-confirm").addEventListener("click", () => {
 for (const [id, direction] of [["load-step-up",1],["load-step-down",-1]]) {
   byId(id).addEventListener("click", () => {
     const token = loadCalibrationSnapshot.action_token;
-    if (token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"step", token, delta_mm:direction*Number(byId("load-step-size").value)});
+    const delta = direction * Number(byId("load-step-size").value);
+    if (!byId(id).disabled && !calibrationStepReason(delta) && token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"step", token, delta_mm:delta});
   });
 }
+byId("load-step-size").addEventListener("change", updateSetupControls);
 byId("load-calibration-finish").addEventListener("click", () => {
   const token = loadCalibrationSnapshot.action_token;
   if (token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"finish", token});
@@ -1134,3 +1192,195 @@ byId("tcp-form").addEventListener("submit", async event => {
 });
 refreshTcp();
 window.setInterval(refreshTcp, 5000);
+
+const probingInputs = {
+  first_speed_mm_s: "probing-search-speed",
+  second_speed_mm_s: "probing-fine-speed",
+  lift_speed_mm_s: "probing-lift-speed",
+  mesh_columns: "probing-mesh-columns",
+  mesh_rows: "probing-mesh-rows",
+  mesh_speed_mm_s: "probing-mesh-speed",
+  mesh_samples: "probing-mesh-samples",
+  mesh_repeatability_mm: "probing-repeatability",
+};
+const probingBounds = {
+  first_speed_mm_s: [.5, 10], second_speed_mm_s: [.02, 1],
+  lift_speed_mm_s: [1, 20], mesh_columns: [2, 9], mesh_rows: [2, 9],
+  mesh_speed_mm_s: [.02, .2], mesh_samples: [3, 5], mesh_repeatability_mm: [.005, .05],
+};
+
+function probingValues() {
+  return Object.fromEntries(Object.entries(probingInputs).map(([key, id]) =>
+    [key, byId(id).value.trim() === "" ? NaN : Number(byId(id).value)]));
+}
+
+function validProbingSettings(values) {
+  return Object.entries(probingBounds).every(([key, [min, max]]) =>
+    Number.isFinite(values[key]) && values[key] >= min && values[key] <= max) &&
+    [values.mesh_samples, values.mesh_columns, values.mesh_rows].every(Number.isInteger) &&
+    values.second_speed_mm_s < values.first_speed_mm_s;
+}
+
+function updateProbingControls() {
+  const occupied = Boolean(setupBusy() || syncSnapshot.busy || syncActionInFlight || bedProbeSnapshot.busy || bedProbeActionInFlight || !latestAxisForgeIdle);
+  const values = probingValues();
+  byId("probing-fine-speed").setCustomValidity(Number.isFinite(values.second_speed_mm_s) && Number.isFinite(values.first_speed_mm_s) &&
+    values.second_speed_mm_s >= values.first_speed_mm_s ? "Fine rehoming must be slower than the initial search." : "");
+  byId("probing-fields").disabled = occupied || !probingAvailable;
+  byId("probing-save").disabled = occupied || !probingAvailable || !validProbingSettings(values) || !probingDirty || probingConflict;
+  byId("probing-reload").disabled = probingSaveInFlight || probingRefreshInFlight;
+  setBadge("probing-settings-badge", probingSaveInFlight ? "Saving…" : !probingAvailable ? "Unavailable" : occupied ? "Operation active" :
+    probingConflict ? "Reload required" : probingDirty ? "Unsaved changes" : "Saved", probingConflict ? false : undefined);
+  const saved = probingSnapshot?.settings;
+  byId("probing-saved").textContent = saved ? `Saved: initial ${saved.first_speed_mm_s} mm/s · fine ${saved.second_speed_mm_s} mm/s · upward ${saved.lift_speed_mm_s} mm/s · ${saved.mesh_columns}×${saved.mesh_rows} mesh (${saved.mesh_columns * saved.mesh_rows} points) at ${saved.mesh_speed_mm_s} mm/s · ${saved.mesh_samples} contacts per point · maximum spread ${saved.mesh_repeatability_mm} mm.` :
+    "Reading the saved homing and mesh settings…";
+}
+
+function acceptProbingSettings(body, replaceInputs=false) {
+  if (!body || typeof body.revision !== "string" || !body.settings || !validProbingSettings(body.settings)) {
+    throw new Error("The saved homing settings are invalid or unavailable.");
+  }
+  const revisionChanged = probingSnapshot && probingSnapshot.revision !== body.revision;
+  if (replaceInputs || (!probingDirty && !probingConflict)) {
+    for (const [key, id] of Object.entries(probingInputs)) byId(id).value = body.settings[key];
+    probingDirty = false; probingConflict = false; probingSnapshot = body;
+  } else if (revisionChanged) {
+    probingConflict = true;
+    showMessage("probing-message", "Saved homing settings changed while you were editing. Reload saved settings, then review your changes.", true);
+  } else {
+    probingSnapshot = body;
+  }
+  probingAvailable = true;
+}
+
+async function refreshProbing(replaceInputs=false) {
+  if (probingRefreshInFlight || probingSaveInFlight) return;
+  probingRefreshInFlight = true;
+  const version = probingRequestVersion;
+  updateProbingControls();
+  try {
+    const body = await request("/api/setup/probing");
+    if (version !== probingRequestVersion) return;
+    acceptProbingSettings(body, replaceInputs);
+    if (replaceInputs) showMessage("probing-message", "Loaded the saved homing and mesh settings.");
+  } catch (error) {
+    if (version !== probingRequestVersion) return;
+    probingAvailable = false;
+    showMessage("probing-message", error.message, true);
+  } finally { probingRefreshInFlight = false; updateSyncControls(); }
+}
+
+for (const id of Object.values(probingInputs)) byId(id).addEventListener("input", () => {
+  const values = probingValues();
+  probingDirty = !probingSnapshot || Object.keys(probingInputs).some(key => values[key] !== probingSnapshot.settings[key]);
+  updateSyncControls();
+});
+byId("probing-reload").addEventListener("click", () => refreshProbing(true));
+byId("probing-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (byId("probing-save").disabled || !byId("probing-form").reportValidity()) return;
+  const settings = probingValues();
+  probingSaveInFlight = true; probingRequestVersion++;
+  updateSyncControls();
+  try {
+    const result = await request("/api/setup/probing", {method:"POST", body:JSON.stringify({revision:probingSnapshot.revision, settings})});
+    acceptProbingSettings(result, true);
+    showMessage("probing-message", result.message || "Homing and mesh settings saved for the next routine.");
+    if (result.changed) { selectedPreflightState = null; loadPreflight(); refreshSync(); }
+  } catch (error) {
+    // The server may have committed a write before a response was lost. Do not
+    // automatically retry against a revision that may no longer be current.
+    probingConflict = true;
+    showMessage("probing-message", `${error.message} Reload saved settings before retrying.`, true);
+  } finally { probingSaveInFlight = false; updateSyncControls(); }
+});
+refreshProbing();
+window.setInterval(refreshProbing, 5000);
+
+function bedGeometryValues() {
+  const values = ["bed-width", "bed-depth", "bed-margin"].map(id =>
+    byId(id).value.trim() === "" ? NaN : Number(byId(id).value));
+  return {width_mm: values[0], depth_mm: values[1], probe_margin_mm: values[2]};
+}
+
+function validBedGeometry(v) {
+  return Object.values(v).every(Number.isFinite) && v.width_mm >= 10 && v.width_mm <= 2000 &&
+    v.depth_mm >= 10 && v.depth_mm <= 2000 && v.probe_margin_mm >= 0 &&
+    2*v.probe_margin_mm < Math.min(v.width_mm, v.depth_mm);
+}
+
+function updateBedGeometryControls() {
+  const occupied = Boolean(setupBusy() || syncSnapshot.busy || syncActionInFlight || bedProbeSnapshot.busy || bedProbeActionInFlight || !latestAxisForgeIdle);
+  const v = bedGeometryValues(), valid = validBedGeometry(v);
+  byId("bed-margin").setCustomValidity(Number.isFinite(v.probe_margin_mm) &&
+    2*v.probe_margin_mm >= Math.min(v.width_mm, v.depth_mm) ? "Margin must leave a positive mesh area." : "");
+  byId("bed-settings-fields").disabled = occupied || !bedSettingsAvailable;
+  byId("bed-settings-save").disabled = occupied || !bedSettingsAvailable || !valid || !bedSettingsDirty || bedSettingsConflict;
+  byId("bed-settings-reload").disabled = bedSettingsSaveInFlight || bedSettingsRefreshInFlight;
+  setBadge("bed-settings-badge", bedSettingsSaveInFlight ? "Saving…" : !bedSettingsAvailable ? "Unavailable" : occupied ? "Operation active" :
+    bedSettingsConflict ? "Reload required" : bedSettingsDirty ? "Unsaved changes" : "Saved", bedSettingsConflict ? false : undefined);
+  const saved = bedSettingsSnapshot;
+  byId("bed-settings-saved").textContent = saved ? `Saved bed: ${saved.bed_size_mm.join(" × ")} mm · edge margin ${saved.probe_margin_mm} mm.` : "Reading saved bed dimensions…";
+  byId("bed-settings-area").textContent = valid ? `${bedSettingsDirty ? "Preview" : "Mesh area"}: X ${v.probe_margin_mm}–${v.width_mm-v.probe_margin_mm} mm, Y ${v.probe_margin_mm}–${v.depth_mm-v.probe_margin_mm} mm.` : "Enter dimensions and a margin that leave a positive probing area.";
+  byId("bed-settings-mesh").textContent = saved?.bed_mesh?.message || "";
+}
+
+function acceptBedGeometry(body, replaceInputs=false) {
+  const values = {width_mm:body?.bed_size_mm?.[0], depth_mm:body?.bed_size_mm?.[1], probe_margin_mm:body?.probe_margin_mm};
+  if (!validBedGeometry(values) || typeof body.revision !== "string") throw new Error("Saved bed dimensions are invalid or unavailable.");
+  if (replaceInputs || (!bedSettingsDirty && !bedSettingsConflict)) {
+    byId("bed-width").value = values.width_mm;
+    byId("bed-depth").value = values.depth_mm;
+    byId("bed-margin").value = values.probe_margin_mm;
+    bedSettingsDirty = bedSettingsConflict = false;
+    bedSettingsSnapshot = body;
+  } else if (bedSettingsSnapshot && body.revision !== bedSettingsSnapshot.revision) {
+    bedSettingsConflict = true;
+    showMessage("bed-settings-message", "AxisForge configuration changed while you were editing. Reload dimensions and review your changes.", true);
+  } else {
+    bedSettingsSnapshot = body;
+  }
+  bedSettingsAvailable = true;
+}
+
+async function refreshBedGeometry(replaceInputs=false) {
+  if (bedSettingsRefreshInFlight || bedSettingsSaveInFlight) return;
+  bedSettingsRefreshInFlight = true;
+  const version = bedSettingsRequestVersion;
+  updateBedGeometryControls();
+  try {
+    const body = await request("/api/setup/bed");
+    if (version !== bedSettingsRequestVersion) return;
+    acceptBedGeometry(body, replaceInputs);
+    if (replaceInputs) showMessage("bed-settings-message", "Loaded saved bed dimensions.");
+  } catch (error) {
+    if (version !== bedSettingsRequestVersion) return;
+    bedSettingsAvailable = false;
+    showMessage("bed-settings-message", error.message, true);
+  } finally { bedSettingsRefreshInFlight = false; updateSyncControls(); }
+}
+
+for (const id of ["bed-width", "bed-depth", "bed-margin"]) byId(id).addEventListener("input", () => {
+  const values = bedGeometryValues(), saved = bedSettingsSnapshot;
+  bedSettingsDirty = !saved || values.width_mm !== saved.bed_size_mm[0] || values.depth_mm !== saved.bed_size_mm[1] || values.probe_margin_mm !== saved.probe_margin_mm;
+  updateSyncControls();
+});
+byId("bed-settings-reload").addEventListener("click", () => refreshBedGeometry(true));
+byId("bed-settings-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  if (byId("bed-settings-save").disabled || !byId("bed-settings-form").reportValidity()) return;
+  const values = bedGeometryValues();
+  bedSettingsSaveInFlight = true; bedSettingsRequestVersion++;
+  updateSyncControls();
+  try {
+    const body = await request("/api/setup/bed", {method:"POST", body:JSON.stringify({...values, revision:bedSettingsSnapshot.revision})});
+    acceptBedGeometry(body, true);
+    showMessage("bed-settings-message", body.message);
+    if (body.changed) { selectedPreflightState = null; loadPreflight(); refreshSync(); refreshTcp(); }
+  } catch (error) {
+    bedSettingsConflict = true;
+    showMessage("bed-settings-message", `${error.message} Reload saved dimensions before retrying.`, true);
+  } finally { bedSettingsSaveInFlight = false; updateSyncControls(); }
+});
+refreshBedGeometry();
+window.setInterval(refreshBedGeometry, 5000);

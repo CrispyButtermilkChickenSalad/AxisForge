@@ -3,12 +3,13 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch, AsyncMock
 
 from fastapi.testclient import TestClient
 
 from bridge_dashboard.app import create_app
-from bridge_dashboard.axisforge import AxisForgeError
+from bridge_dashboard.axisforge import AxisForgeError, AxisForgeRunner
 from bridge_dashboard.config import Settings
 from bridge_dashboard.moonraker import MoonrakerError
 from bridge_dashboard.bed_probe import BedProbeError
@@ -64,21 +65,10 @@ class FakeAxisForge:
         return {"configured": True, "jobs": ["part.gcode"], "error": None}
 
     def job_path(self,name):
-        path=self.root/name
-        if not path.exists(): raise AxisForgeError('Missing G-code')
-        return path
+        return AxisForgeRunner(SimpleNamespace(gcode_root=self.root)).job_path(name)
 
     def stage_upload(self, name, source):
-        if not name.endswith(".gcode"):
-            raise AxisForgeError("Only .gcode files are accepted")
-        destination = self.root / name
-        if destination.exists():
-            raise AxisForgeError("A G-code file with that name already exists")
-        destination.write_bytes(source.read())
-        if not destination.stat().st_size:
-            destination.unlink()
-            raise AxisForgeError("The uploaded G-code file is empty")
-        return destination
+        return AxisForgeRunner(SimpleNamespace(gcode_root=self.root)).stage_upload(name, source)
 
     async def start(self, job, dry_run):
         self.started.append((job, dry_run))
@@ -184,7 +174,7 @@ class DashboardApiTests(unittest.TestCase):
             self.assertEqual(self.client.post('/api/load-calibration/confirm',json={'stage':'tare','token':'a'*24}).status_code,200)
             self.assertEqual(self.client.post('/api/load-calibration/confirm',json={'stage':'tare','token':'a'*24}).status_code,409)
             self.assertEqual(send.await_count,1)
-        for body in ({'command':'step','token':'a'*24,'delta_mm':1.},
+        for body in ({'command':'step','token':'a'*24,'delta_mm':11.},
                      {'command':'power_on','token':'a'*24}):
             self.assertEqual(self.client.post('/api/load-calibration/action',json=body).status_code,422)
         routine._active=False
@@ -292,9 +282,12 @@ class DashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()["ready"])
-        self.assertEqual(self.moonraker.uploads, [("part.gcode", b"G1 X1\n")])
+        name = response.json()['job']
+        self.assertRegex(name,r'^part--[0-9a-f]{12}\.gcode$')
+        self.assertEqual(response.json()['original_name'],'part.gcode')
+        self.assertEqual(self.moonraker.uploads, [(name, b"G1 X1\n")])
         self.assertEqual(
-            (Path(self.temp_dir.name) / "part.gcode").read_bytes(),
+            (Path(self.temp_dir.name) / name).read_bytes(),
             b"G1 X1\n",
         )
 
@@ -330,6 +323,32 @@ class DashboardApiTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 503)
         self.assertFalse((Path(self.temp_dir.name) / "part.gcode").exists())
+        self.assertFalse(list(Path(self.temp_dir.name).glob('part--*.gcode')))
+
+    def test_preloaded_file_copy_preserves_source_and_requires_new_preflight(self):
+        path = Path(self.temp_dir.name)/'preloaded.gcode'
+        path.write_bytes(b'G28\nG0 X100 Y100 Z5 F600\nG1 X101\n')
+        result = self.client.post('/api/jobs/copy-to-klipper',json={'job':path.name})
+        self.assertEqual(result.status_code,200,result.text)
+        body = result.json()
+        self.assertFalse(body['ready'])
+        self.assertNotEqual(body['job'],path.name)
+        self.assertEqual((path.parent/body['job']).read_bytes(),path.read_bytes())
+        self.assertEqual(self.moonraker.uploads,[(body['job'],path.read_bytes())])
+        self.assertFalse(self.axisforge.started)
+
+    def test_copy_failure_retains_source_and_active_operations_block_copy(self):
+        path = Path(self.temp_dir.name)/'preloaded.gcode'; path.write_bytes(b'G1 X1\n')
+        self.moonraker.fail_upload = True
+        result = self.client.post('/api/jobs/copy-to-klipper',json={'job':path.name})
+        self.assertEqual(result.status_code,503,result.text)
+        self.assertEqual(list(path.parent.glob('preloaded*.gcode')),[path])
+        self.bed_probe.active = True
+        self.assertEqual(self.client.post('/api/jobs/copy-to-klipper',json={'job':path.name}).status_code,409)
+        self.bed_probe.active = False
+        with patch('bridge_dashboard.app.Workflow.busy',return_value=True):
+            self.assertEqual(self.client.post('/api/jobs/copy-to-klipper',json={'job':path.name}).status_code,409)
+        self.assertEqual(self.client.post('/api/jobs/copy-to-klipper',json={'job':'../outside.gcode'}).status_code,400)
 
     def test_links_include_configured_printer_ui_and_alps_logger(self):
         response = self.client.get("/api/links")

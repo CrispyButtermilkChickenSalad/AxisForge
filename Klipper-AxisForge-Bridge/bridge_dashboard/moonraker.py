@@ -26,12 +26,15 @@ class MoonrakerClient:
 
     async def upload_gcode(self, filename, local_path):
         """Upload a staged G-code file to Moonraker's gcodes root."""
+        if await self.file_metadata(filename) is not None:
+            raise MoonrakerError('A Klipper file already uses this version name; retry to create a new version')
         try:
             with local_path.open("rb") as gcode_file:
                 response = await self._client.post(
                     "/server/files/upload",
                     data={"root": "gcodes"},
                     files={"file": (filename, gcode_file, "application/octet-stream")},
+                    timeout=60.,
                 )
                 response.raise_for_status()
         except (httpx.HTTPError, OSError) as error:

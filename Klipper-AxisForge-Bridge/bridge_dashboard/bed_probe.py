@@ -38,7 +38,7 @@ class BedProbeRunner:
         self._consumed_tokens = set()
         self._logs = deque(maxlen=12)
         self._snapshot = {'state': 'idle', 'message': 'Home and probe when the build surface is placed or moved.',
-                          'progress': 0., 'current_point': 0, 'total_points': 9,
+                          'progress': 0., 'current_point': 0, 'total_points': 0,
                           'confirmation': None, 'dry_run': False}
 
     def busy(self):
@@ -70,7 +70,7 @@ class BedProbeRunner:
             self._program_stop_confirmed = False
             self._consumed_tokens.clear(); self._logs.clear()
             self._snapshot = {'state': 'starting', 'message': 'Checking the sensor and robot before confirmation.',
-                              'progress': 0., 'current_point': 0, 'total_points': 9,
+                              'progress': 0., 'current_point': 0, 'total_points': 0,
                               'confirmation': None, 'dry_run': dry_run}
             env = dict(os.environ, PYTHONUNBUFFERED='1', MOONRAKER_URL=self.settings.moonraker_url,
                        OPENBLAS_NUM_THREADS='1', OMP_NUM_THREADS='1')

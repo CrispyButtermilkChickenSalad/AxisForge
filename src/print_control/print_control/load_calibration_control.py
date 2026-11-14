@@ -5,7 +5,7 @@ import secrets
 from print_control.probe_control import ProbeControl
 
 
-STEP_SIZES = (.001, .01, .05, .5)
+STEP_SIZES = (.001, .01, .05, .1, .5, 1., 10.)
 
 
 class LoadCalibrationControl(ProbeControl):

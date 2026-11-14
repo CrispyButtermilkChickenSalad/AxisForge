@@ -28,11 +28,19 @@ class CalibrationRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.runner._action_received_at=time.monotonic()-10.
         with self.assertRaises(BedProbeError):await self.runner.action('step',self.token,.01)
         self.runner._action_received_at=time.monotonic()
-        for delta in (True,float('nan'),1.,0.):
+        for delta in (True,float('nan'),2.,11.,0.):
             with self.assertRaises(BedProbeError):await self.runner.action('step',self.token,delta)
         self.runner._apply_event(dict(state='waiting_tare',confirmation={'stage':'tare','token':'b'*32}))
         with self.assertRaises(BedProbeError):await self.runner.action('step',self.token,-.01)
         self.runner._send.assert_not_awaited()
+
+    async def test_requested_steps_forward_once_with_fresh_tokens(self):
+        for index,delta in enumerate((10.,-10.,1.,-1.,.1,-.1,.05,-.05)):
+            token=('%032x' % (index+1))
+            self.runner._apply_event(dict(state='adjusting_load',action_token=token))
+            await self.runner.action('step',token,delta)
+            self.runner._send.assert_awaited_with(dict(command='step',token=token,delta_mm=delta))
+            with self.assertRaises(BedProbeError):await self.runner.action('step',token,delta)
 
     async def test_wire_failure_uses_existing_stop_supervision(self):
         self.runner._send.side_effect=BedProbeError('pipe broke')

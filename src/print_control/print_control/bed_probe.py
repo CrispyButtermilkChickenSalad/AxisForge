@@ -47,12 +47,15 @@ Bed probe: put paper under the nozzle and lower until it just drags.
 """
 
 
-def grid_points(bed_size_mm, margin_mm):
-    """Return 3x3 G-code XY points in serpentine order, starting at the front left."""
-    columns = [(margin_mm, size / 2, size - margin_mm) for size in bed_size_mm]
+def grid_points(bed_size_mm, margin_mm, columns=3, rows=3):
+    """Return a 2..9 by 2..9 XY grid, serpentine from the same front-left corner."""
+    if any(type(count) is not int or not 2 <= count <= 9 for count in (columns, rows)):
+        raise ValueError('Mesh columns and rows must be integers from 2 to 9')
+    axes = [np.linspace(margin_mm, size-margin_mm, count).tolist()
+            for size, count in zip(bed_size_mm, (columns, rows))]
     points = []
-    for row, y in enumerate(columns[1]):
-        xs = columns[0] if row % 2 == 0 else columns[0][::-1]
+    for row, y in enumerate(axes[1]):
+        xs = axes[0] if row % 2 == 0 else axes[0][::-1]
         points.extend((x, y) for x in xs)
     return points
 
@@ -84,10 +87,12 @@ class BedProbe(MotionExecutor):
     def __init__(self, settings, motion_config, args):
         """Plan with the printing planner; dry runs simulate the robot."""
         super().__init__('bed_probe')
+        if args.margin_mm is None:
+            args.margin_mm = settings.bed_probe_margin_mm
         if not all(math.isfinite(v) for v in (args.margin_mm, args.paper_mm, args.floor_mm,
                                              args.jog_speed, args.xy_step_mm)):
             raise ValueError('Probe distances and speeds must be finite')
-        if args.margin_mm <= 0 or 2 * args.margin_mm >= min(settings.bed_size_mm):
+        if args.margin_mm < 0 or 2 * args.margin_mm >= min(settings.bed_size_mm):
             raise ValueError('margin_mm must leave a positive grid inside bed_size_mm')
         if (args.paper_mm < 0 or args.floor_mm <= 0 or args.jog_speed <= 0 or
                 args.xy_step_mm <= 0):
@@ -106,7 +111,7 @@ class BedProbe(MotionExecutor):
         self.args = args
         planner = GCodePlanner(self.settings, motion_config)
         self.initialize_execution(planner.config, planner, extrusion_enabled=False)
-        self.points = grid_points(settings.bed_size_mm, args.margin_mm)
+        self.points = self.probe_grid()
         self.records = {}
         self.index = 0
         self.step_mm = 0.1
@@ -116,6 +121,9 @@ class BedProbe(MotionExecutor):
             self.joints = np.deg2rad(self.config.dry_run_seed_deg)
 
     # --- geometry -------------------------------------------------------------------------
+
+    def probe_grid(self):
+        return grid_points(self.settings.bed_size_mm, self.args.margin_mm)
 
     def bed_point(self, xy, height=0.0):
         """Robot Base position of a G-code point at a height above the configured bed."""
@@ -333,7 +341,7 @@ def parse_args(argv):
     parser.add_argument('--config', default=str(default_config),
                         help='YAML with the gcode_interpreter parameters')
     parser.add_argument('--output', help='result YAML (default: bed_probe_file from --config)')
-    parser.add_argument('--margin-mm', dest='margin_mm', type=float, default=30.0,
+    parser.add_argument('--margin-mm', dest='margin_mm', type=float, default=None,
                         help='grid distance from the bed edges')
     parser.add_argument('--paper-mm', dest='paper_mm', type=float, default=None,
                         help='paper thickness subtracted from the nozzle Z')

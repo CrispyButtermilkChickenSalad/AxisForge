@@ -5,11 +5,11 @@ contact:
   trigger_mode: raw
   contact_delta_counts: 20000.0
   max_delta_counts: 60000.0
-  step_mm: 0.02
-  speed_mm_s: 0.2
+  step_mm: 0.01
+  speed_mm_s: 0.1
   retract_mm: 0.5
-  samples: 3
-  repeatability_mm: 0.05
+  samples: 5
+  repeatability_mm: 0.02
   contact_offset_mm: 0.0
   settle_s: 0.15
   window_s: 0.1
@@ -17,15 +17,22 @@ contact:
   max_nozzle_temp_c: 50.0
   consecutive_samples: 5
 homing:
-  first_speed_mm_s: 0.5
-  second_speed_mm_s: 0.1
-  first_step_mm: 0.05
-  second_step_mm: 0.01
+  # Continuous Z passes with acceleration/deceleration ramps and cruise speed.
+  first_speed_mm_s: 10.0
+  second_speed_mm_s: 0.2
+  lift_speed_mm_s: 20.0
+  mesh_columns: 3
+  mesh_rows: 3
+  acceleration_mm_s2: 50.0
+  # Host-observed freshness/stop rejection limits, not hardware force limits.
+  sample_age_s: 0.15
+  cancel_timeout_s: 0.2
+  max_stop_travel_mm: 0.5
   retract_mm: 3.0
   max_descent_mm: 20.0
   max_retest_difference_mm: 0.5
   clearance_above_start_mm: 10.0
-  travel_speed_mm_s: 5.0
+  # XY travel inherits max_travel_speed_mm_s from ur_master.yaml.
   confirmation_timeout_s: 300.0
   heartbeat_timeout_s: 5.0
   confirmation_pose_tolerance_mm: 0.1

@@ -307,6 +307,7 @@ class MotionExecutor(Node):
                         'Trajectory ended before cancellation was acknowledged.'
                     )
         # Give reliable DDS a short bounded opportunity to deliver the stop command.
-        for _ in range(5):
-            self.set_extrusion(0.0, force=True)
-            rclpy.spin_once(self, timeout_sec=0.02)
+        if self.speed_publisher is not None:
+            for _ in range(5):
+                self.set_extrusion(0.0, force=True)
+                rclpy.spin_once(self, timeout_sec=0.02)

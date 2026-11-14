@@ -41,7 +41,7 @@ class LoadCalibrationRunner(BedProbeRunner):
                 raise BedProbeError('This step is stale or motion is busy; refresh calibration status')
             if command not in ('step','finish'):
                 raise BedProbeError('Unknown calibration action')
-            if command == 'step' and (type(delta_mm) not in (int,float) or abs(delta_mm) not in (.001,.01,.05,.5)):
+            if command == 'step' and (type(delta_mm) not in (int,float) or abs(delta_mm) not in (.001,.01,.05,.1,.5,1.,10.)):
                 raise BedProbeError('Choose a supported baby-step size')
             self._consumed_tokens.add(token)
             self._snapshot['action_token'] = None

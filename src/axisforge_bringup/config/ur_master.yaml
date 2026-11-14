@@ -3,6 +3,7 @@ gcode_interpreter:
     # G-code coordinates -> robot Base, mm; keeps the previous placement convention.
     origin_at_center: true
     bed_size_mm: [235.0, 235.0]
+    bed_probe_margin_mm: 30.0        # Inset of the mesh from each bed edge
     # X/Y offset = measured - 235
     x_offset: -854.63
     y_offset: -497.28

@@ -22,6 +22,8 @@ from bridge_dashboard.bed_probe import BedProbeRunner, BedProbeError
 from bridge_dashboard.load_calibration import LoadCalibrationRunner
 from bridge_dashboard.robot_connection import RobotConnectionClient, RobotConnectionError
 from bridge_dashboard.tcp_settings import TcpSettings, TcpSettingsError, TcpSettingsConflict
+from bridge_dashboard.probing_settings import ProbingSettings, ProbingSettingsError, ProbingSettingsConflict
+from bridge_dashboard.bed_settings import BedSettings, BedSettingsError, BedSettingsConflict
 
 logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -89,7 +91,15 @@ class LoadCalibrationAction(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
     command: Literal['step', 'finish']
     token: str = Field(min_length=16, max_length=128)
-    delta_mm: float | None = Field(default=None, ge=-.5, le=.5, allow_inf_nan=False)
+    delta_mm: float | None = Field(default=None, ge=-10., le=10., allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def supported_step(self):
+        if self.command == 'step' and (self.delta_mm is None or abs(self.delta_mm) not in (.001, .01, .05, .1, .5, 1., 10.)):
+            raise ValueError('Choose a supported Z step size')
+        if self.command == 'finish' and self.delta_mm is not None:
+            raise ValueError('Finish does not accept a movement distance')
+        return self
 
 
 class TcpSettingsRequest(BaseModel):
@@ -98,6 +108,49 @@ class TcpSettingsRequest(BaseModel):
     y_mm: float = Field(ge=-1000, le=1000, allow_inf_nan=False)
     z_mm: float = Field(ge=-1000, le=1000, allow_inf_nan=False)
     revision: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+class ProbingValues(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    first_speed_mm_s: float = Field(ge=.5, le=10., allow_inf_nan=False)
+    second_speed_mm_s: float = Field(ge=.02, le=1., allow_inf_nan=False)
+    lift_speed_mm_s: float = Field(ge=1., le=20., allow_inf_nan=False)
+    mesh_columns: int = Field(ge=2, le=9)
+    mesh_rows: int = Field(ge=2, le=9)
+    mesh_speed_mm_s: float = Field(ge=.02, le=.2, allow_inf_nan=False)
+    mesh_samples: int = Field(ge=3, le=5)
+    mesh_repeatability_mm: float = Field(ge=.005, le=.05, allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def slower_precision_pass(self):
+        if self.second_speed_mm_s >= self.first_speed_mm_s:
+            raise ValueError('Precision rehoming must be slower than the initial surface search')
+        return self
+
+
+class ProbingSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    settings: ProbingValues
+    revision: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+
+class BedSettingsRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    width_mm: float = Field(ge=10., le=2000., allow_inf_nan=False)
+    depth_mm: float = Field(ge=10., le=2000., allow_inf_nan=False)
+    probe_margin_mm: float = Field(ge=0., allow_inf_nan=False)
+    revision: str = Field(pattern=r'^[0-9a-f]{64}$')
+
+    @model_validator(mode='after')
+    def positive_probe_area(self):
+        if 2*self.probe_margin_mm >= min(self.width_mm, self.depth_mm):
+            raise ValueError('Probe margin must be less than half the smaller bed dimension')
+        return self
+
+
+class CopyJobRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    job: str
 
 
 def create_app(settings=None):
@@ -122,6 +175,8 @@ def create_app(settings=None):
             invalidate_preflight=app.state.workflow.invalidate_preflight)
         app.state.robot_connection = RobotConnectionClient(settings.robot_connection_url)
         app.state.tcp_settings = TcpSettings(settings.axisforge_config)
+        app.state.probing_settings = ProbingSettings(settings.axisforge_config)
+        app.state.bed_settings = BedSettings(settings.axisforge_config)
         try:
             await app.state.rosbridge.start()
             yield
@@ -180,6 +235,46 @@ def create_app(settings=None):
                     request.revision,app.state.workflow.invalidate_preflight)
             except TcpSettingsConflict as error: raise HTTPException(409,str(error)) from error
             except TcpSettingsError as error: raise HTTPException(400,str(error)) from error
+
+    @app.get('/api/setup/probing')
+    async def probing_settings():
+        try:
+            return app.state.probing_settings.status()
+        except ProbingSettingsError as error:
+            raise HTTPException(503, str(error)) from error
+
+    @app.get('/api/setup/bed')
+    async def bed_settings():
+        try:
+            return app.state.bed_settings.status()
+        except BedSettingsError as error:
+            raise HTTPException(503, str(error)) from error
+
+    @app.post('/api/setup/bed')
+    async def save_bed_settings(request: BedSettingsRequest):
+        async with operation_lock:
+            require_jobs_idle()
+            await require_probe_idle()
+            try:
+                return app.state.bed_settings.save(request.width_mm, request.depth_mm,
+                    request.probe_margin_mm, request.revision, app.state.workflow.invalidate_preflight)
+            except BedSettingsConflict as error:
+                raise HTTPException(409, str(error)) from error
+            except BedSettingsError as error:
+                raise HTTPException(400, str(error)) from error
+
+    @app.post('/api/setup/probing')
+    async def save_probing_settings(request: ProbingSettingsRequest):
+        async with operation_lock:
+            require_jobs_idle()
+            await require_probe_idle()
+            try:
+                return app.state.probing_settings.save(request.settings.model_dump(), request.revision,
+                                                       app.state.workflow.invalidate_preflight)
+            except ProbingSettingsConflict as error:
+                raise HTTPException(409, str(error)) from error
+            except ProbingSettingsError as error:
+                raise HTTPException(400, str(error)) from error
 
     @app.get('/api/robot/connection')
     async def robot_connection_status():
@@ -307,35 +402,40 @@ def create_app(settings=None):
             raise HTTPException(status_code=400, detail="Choose a .gcode file")
         async with upload_lock, operation_lock:
             await require_probe_idle()
-            if app.state.workflow.busy():
-                raise HTTPException(status_code=409,detail='Wait for the current preflight or job to finish')
+            require_jobs_idle()
             try:
                 staged_path = app.state.axisforge.stage_upload(file.filename, file.file)
             except AxisForgeError as error:
                 raise HTTPException(status_code=400, detail=str(error)) from error
+            return await forward_staged_job(staged_path, file.filename)
+
+    @app.post('/api/jobs/copy-to-klipper')
+    async def copy_job_to_klipper(request: CopyJobRequest):
+        async with upload_lock, operation_lock:
+            require_jobs_idle()
+            await require_probe_idle()
             try:
-                await app.state.moonraker.upload_gcode(file.filename, staged_path)
-            except MoonrakerError as error:
-                try:
-                    staged_path.unlink()
-                except OSError as cleanup_error:
-                    logger.exception(
-                        "Could not remove locally staged file after failed Moonraker upload"
-                    )
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"{error}; local staged file remains at {staged_path.name}",
-                    ) from cleanup_error
-                raise HTTPException(status_code=503, detail=str(error)) from error
-            return {
-                "job": file.filename,
-                "uploaded": True,
-                "ready": False,
-                "message": (
-                    "Uploaded to Klipper and staged for AxisForge; "
-                    "run the Klipper and robot preflights before starting"
-                ),
-            }
+                original = app.state.axisforge.job_path(request.job)
+                with original.open('rb') as source:
+                    staged = app.state.axisforge.stage_upload(original.name, source)
+            except (AxisForgeError, OSError) as error:
+                raise HTTPException(400, str(error)) from error
+            return await forward_staged_job(staged, original.name)
+
+    async def forward_staged_job(staged_path, original_name):
+        try:
+            await app.state.moonraker.upload_gcode(staged_path.name, staged_path)
+        except MoonrakerError as error:
+            try:
+                staged_path.unlink()
+            except OSError as cleanup_error:
+                logger.exception('Could not remove locally staged file after failed Moonraker upload')
+                raise HTTPException(503, f'{error}; local staged file remains at {staged_path.name}') from cleanup_error
+            raise HTTPException(503, str(error)) from error
+        return {'job': staged_path.name, 'original_name': original_name,
+                'uploaded': True, 'ready': False,
+                'message': 'Saved as a new version on both hosts; file contents are unchanged. '
+                           'Run both preflights; copying does not certify Klipper command compatibility.'}
 
     @app.get("/api/links")
     async def links():

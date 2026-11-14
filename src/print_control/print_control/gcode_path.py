@@ -28,6 +28,7 @@ class GCodeConfig:
     z_offset: float = 195.5
     origin_at_center: bool = False
     bed_size_mm: tuple = (235.0, 235.0)
+    bed_probe_margin_mm: float = 30.0
     wrist_angle: float = 90.0
     nozzle_roll_deg: float = 180.0
     nozzle_pitch_deg: float = 0.0
@@ -74,6 +75,9 @@ class GCodeConfig:
         if len(self.bed_size_mm) != 2 or not all(
                 math.isfinite(value) and value > 0 for value in self.bed_size_mm):
             raise ValueError('bed_size_mm must have two positive finite values')
+        if (type(self.bed_probe_margin_mm) not in (int, float) or
+                not math.isfinite(self.bed_probe_margin_mm) or self.bed_probe_margin_mm < 0):
+            raise ValueError('bed_probe_margin_mm must be finite and nonnegative')
         for name, value in vars(self).items():
             if isinstance(value, (int, float)) and not isinstance(value, bool):
                 if not math.isfinite(value):
@@ -95,6 +99,15 @@ class GCodeConfig:
         if self.origin_at_center:
             offset[:2] += np.asarray(self.bed_size_mm) / 2
         return tuple(np.asarray(point) + offset)
+
+    def check_bed_bounds(self, point, source_line=None):
+        """Check resolved G-code XY, including travel, against the physical bed."""
+        x, y = point[:2]
+        width, depth = self.bed_size_mm
+        if not (-1e-6 <= x <= width+1e-6 and -1e-6 <= y <= depth+1e-6):
+            location = 'G-code line %s: ' % source_line if source_line is not None else ''
+            raise ValueError(location+'XY (%g, %g) exceeds configured bed bounds '
+                             'X 0..%g mm, Y 0..%g mm' % (x, y, width, depth))
 
 
 @dataclass
@@ -138,7 +151,7 @@ class GCodePlanner(MotionPlanner):
         if settings.bed_probe_file:
             self.bed = BedSurface.load(
                 settings.bed_probe_file, self.config.tcp_offset_mm, self.config.nozzle_rpy_deg,
-                settings.bed_probe_extrapolation_mm,
+                settings.bed_probe_extrapolation_mm, expected_bed_size=settings.bed_size_mm,
             )
 
     def transform(self, point):
@@ -331,6 +344,11 @@ class GCodePlanner(MotionPlanner):
     def plan_segments(self, segments, seed, progress_callback=None):
         """Preflight the entire file, including positioning and a final nozzle lift."""
         cfg = self.settings
+        # Use the parser's resolved modal coordinates, not raw X/Y words. This
+        # includes purge/park travel and G91/G92 offsets before any IK or motion.
+        for segment in segments:
+            cfg.check_bed_bounds(segment.start, segment.source_line)
+            cfg.check_bed_bounds(segment.end, segment.source_line)
         segments = [segment for segment in segments
                     if not (segment.kind == 'orientation' and segment.delta_e == 0 and
                             segment.start_orientation_deg == segment.orientation_deg)]

@@ -131,6 +131,68 @@ to the Klipper endpoints. Open **http://127.0.0.1:8080**.
 4. **Start synchronized job** when both checks pass and the UR interlocks are
    ready. A result expires after 15 minutes, a file/configuration change or a run.
 
+### Bed dimensions and reusable G-code filenames
+
+In **Setup & calibration → Home & probe bed → Build surface**, set width X, depth Y
+and probe edge margin. The selected 2–9 by 2–9 grid spans X=margin..width−margin
+and Y=margin..depth−margin. The defaults remain **235×235 mm with 30 mm margins**.
+Zero margin is allowed; otherwise it must be less than half the smaller dimension.
+Saving preserves the calibrated physical front-left corner, including compensating
+X/Y offsets when the legacy `origin_at_center` transform is enabled. It clears job
+preflight. Re-probe after resizing: a map recorded for different dimensions is
+rejected. The previous map and configuration backup are kept.
+
+AxisForge checks all resolved XY moves against **0..width and 0..depth** in both
+standalone and synchronized preflight. This includes purge lines and parking;
+relative coordinates, G92 offsets and inch units cannot bypass the check. Bed-mesh
+coverage and robot reach/joint checks also apply.
+
+Every upload gets a new version name, such as `part--a1b2c3d4e5f6.gcode`, on both
+hosts. Re-uploading `part.gcode` preserves earlier versions and never reuses their
+preflight results. To use a file already in AxisForge, select it under **G-code
+dashboard → Job preflight**, press **Copy selected file to Klipper**, then run
+preflight on the automatically selected new version. This copies the original
+bytes unchanged and does not start a print. A failed upload removes only the new
+local copy; its source remains.
+
+### Start/end G-code compatibility
+
+An AxisForge-only dry run is **not** a Klipper compatibility certificate. The
+synchronized workflow compiles the file using this bridge’s defined command set,
+verifies identical file hashes, and then checks the timed plan against AxisForge.
+Use **Start synchronized job** in this dashboard after both preflights; uploading
+a file does not make ordinary Fluidd/Mainsail printing coordinate the robot.
+
+The synchronized parser supports linear G0/G1 XYZ/ABC/E, G20/G21, G90/G91, G92,
+M82/M83, M220/M221, G4/M400, primary-fan M106/M107, T0 and explicit heater
+M104/M109/M140/M190. An initial G28 is replaced by the robot entry approach, with
+a warning; it does not perform ALPS homing or call Klipper’s Cartesian homing.
+Bare M84 does not release the robot’s brakes or disable robot joints.
+`SET_PRESSURE_ADVANCE ADVANCE=…` must match Klipper’s configured value.
+
+The synchronized parser currently rejects **M105**, **M204**, axis-qualified
+**M84 X Y E**, arcs, and arbitrary macros including **START_PRINT/END_PRINT**.
+Klipper itself supports more commands and configured macros; this stricter parser
+must know every operation before it can synchronize it. See the official
+[Klipper commands](https://www.klipper3d.org/G-Codes.html) and
+[slicer guidance](https://www.klipper3d.org/Slicers.html) for that distinction.
+
+For this workflow, use explicit supported heater and fan commands in the slicer’s
+start/end blocks. Remove redundant M105 temperature-query lines. Configure speed,
+acceleration and corner policy through the bridge/Klipper settings instead of
+slicer M204 commands. Omit axis-specific stepper-disable lines; keep robot power
+and program control manual. Do not blindly remove or ignore unknown macros: review
+their homing, offsets, purge, heater and shutdown effects first. Keep purge and park
+coordinates inside both the configured bed and the measured mesh coverage.
+
+The offline audit of the bundled files found most Cura examples first fail on
+M105; their Ender-3 end block also contains `M84 X Y E`. Their X0.1 purge and
+X0/Y235 park positions are outside the current mesh’s 30 mm edge margin.
+`primitive_test.gcode` first fails on M204. The two angle-calibration matrix files
+and `sync-validation-no-extrusion.gcode` passed the offline dialect test with test
+heater limits; live heater, extrusion, clock and robot preflight are still required.
+The audit did not modify any bundled G-code.
+
 ### Home and probe the bed with ALPS
 
 The dashboard owns this routine and supervises its native AxisForge ROS process.
@@ -149,19 +211,53 @@ The dashboard walks through these stages:
 
 1. **Confirm the surface:** verify a flat build surface is under the nozzle and
    the nozzle is unloaded. The routine then records its unloaded sensor baseline
-   and descends only in Z, at **0.5 mm/s** in **0.05 mm** steps. It stops on sustained
+   and descends continuously in Z, accelerating to **10 mm/s**. It stops on sustained
    contact or fails after **20 mm** of descent from the starting height.
-2. **Repeat more slowly:** retract **3 mm**, verify the load clears, then approach
-   again at **0.1 mm/s** in **0.01 mm** steps. The contacts must agree within the
-   configured tolerance before accepting the homed height.
+2. **Precision rehoming:** retract **3 mm**, verify the load clears, then make two
+   continuous contacts at **0.2 mm/s**, retracting between them. These slow contacts
+   must agree within the selected tolerance and determine the homed height; the
+   fast first contact is used only to locate the surface approximately.
 3. **Confirm the front-left mesh point:** lift to **10 mm above the original
    starting Z**, then travel in XY to the existing first grid point (G-code
    **X30 Y30** by default). Confirm that the nozzle is above the intended first
    point and that it is the front-leftmost point of the mesh.
-4. **Measure and return:** automatically probe the nine-point serpentine grid,
-   with three contacts per point and a default maximum Z spread of **0.05 mm**.
+4. **Measure and return:** automatically probe the selected serpentine grid (default **3×3**),
+   at **0.1 mm/s**, with **five contacts per point** and a default maximum Z spread
+   of **0.02 mm**. Save the median measured contact.
    Finish by lifting, returning in XY, and moving in Z to the saved starting nozzle
    pose. This uses the pose captured at the start, not a separate pendant Home pose.
+
+Upward retractions and clearance lifts default to **20 mm/s**, independently
+adjustable from 1–20 mm/s. XY travel inherits AxisForge’s `max_travel_speed_mm_s`
+(**120 mm/s** in the current configuration), replacing the bridge’s old 5 mm/s.
+Acceleration and joint limits remain active; short lifts may not reach cruise speed.
+Choose **2–9 points along each axis** for a square or rectangular mesh (4–81 points).
+Density changes preserve the current bed area, edge margins and front-left origin.
+
+Each homing pass uses one trajectory with smooth acceleration/deceleration and a
+constant-speed middle. ALPS is monitored during motion; there are no per-step
+settling pauses. Contact cancels the trajectory, and fresh stationary feedback is
+required before recording height or retracting. Contact during acceleration can
+occur before cruise speed is reached. Infeasible speeds fail rather than silently
+retiming. Mesh contacts use the same continuous approach at their own slow speed;
+scale calibration keeps its **0.1 mm/s** stepped contact search. Set homing acceleration
+in the native profile's `homing` section;
+legacy homing step-size fields are accepted but no longer used.
+
+In **Setup & calibration → Home & probe bed → Homing and mesh settings**, edit and save
+coarse search speed, precision speed, upward speed, mesh speed, X/Y point counts,
+sample count and repeatability.
+This works offline, takes effect on the next run and invalidates job preflight.
+Active operations block saves, and concurrent edits require Reload. These settings
+control measurement repeatability, not certified absolute bed-height accuracy.
+
+The continuous passes reject latest samples older than **150 ms**, use a **200 ms**
+cancellation deadline with independent UR Stop fallback, and reject more than
+**0.5 mm observed travel after host detection**. These are software checks, not
+physical force/stopping-distance guarantees. Observed ALPS delivery is about
+100 ms per batch: at 10 mm/s, roughly 1 mm of travel can precede the contact report,
+plus stopping travel. Supervised contact commissioning remains necessary; saved
+homing readings include stop acknowledgement time and observed stopping travel.
 
 Only a complete grid followed by a successful return replaces the active bed map.
 Until then, readings remain in `bed_probe.pending.yaml`; the old map is preserved
@@ -279,11 +375,21 @@ program Load/Play have no dashboard controls.
 
 **Start scale routine** asks you to move home manually and confirm scale placement,
 finds contact with a slow Z-only descent, lifts 5 mm, and waits for scale taring.
-Then use single-click Z baby steps to establish two measured loads. Record both
+Then use single-click **10, 1, 0.1 or 0.05 mm** Z steps in either direction (finer
+steps are also available) to establish two measured loads. Travel is bounded to
+25 mm above contact and 0.25 mm below it. Downward steps larger than 0.05 mm must
+end at least 0.5 mm above contact; unexpected load stops coarse descent. Record both
 in **ALPS Logger → Calibration**. Use Up to unload before Finish. This routine
 uses uncalibrated raw counts and never writes the logger/Klipper calibration or
 bed mesh itself. Simulations need no hardware. Physical validation is still needed
 with the nozzle, scale and robot connected.
+
+Use the pendant for initial XY and orientation. AxisForge's nominal nozzle
+orientation is **roll 180°, pitch 0°, yaw 90°**; G-code `A=B=C=0` means no added
+rotation, not zero joint angles or zero pendant TCP angles. Probing preserves the
+measured upright starting orientation. The pendant normally displays a rotation
+vector in radians, not AxisForge's roll/pitch/yaw degrees; keep the measured UR
+installation TCP and payload settings. See the official [UR Pose Editor guide](https://www.universal-robots.com/manuals/EN/HTML/SW5_21/Content/prod-usr-man/complianceUR3e/SW_sections/first_program/pose_editor.htm).
 
 In the parent AxisForge workspace, start the stack with
 `docker compose --profile klipper up -d`. The passive `robot-connection` service
@@ -297,6 +403,13 @@ Additional APIs: `GET /api/robot/connection`, `POST /api/robot/connect`, and
 `/api/load-calibration/{status,start,confirm,action,abort}`. Status is GET; the
 other calibration routes are POST. Confirmation requires its current stage/token;
 a step requires `{"command":"step","token":"<current token>","delta_mm":-0.01}`.
+
+`GET /api/setup/bed` returns dimensions, mesh coverage and a revision. `POST` accepts
+`{"revision":"<current revision>","width_mm":235.0,"depth_mm":235.0,"probe_margin_mm":30.0}`.
+`POST /api/jobs/copy-to-klipper` accepts `{"job":"existing.gcode"}` and returns its new version name.
+
+`GET /api/setup/probing` returns saved settings and a revision. `POST` accepts
+`{"revision":"<current revision>","settings":{"first_speed_mm_s":10.0,"second_speed_mm_s":0.2,"lift_speed_mm_s":20.0,"mesh_columns":3,"mesh_rows":3,"mesh_speed_mm_s":0.1,"mesh_samples":5,"mesh_repeatability_mm":0.02}}`.
 Actions are single-use and expire; they cannot be queued or replayed. All motion
 entry points share the existing ownership and preflight interlocks.
 

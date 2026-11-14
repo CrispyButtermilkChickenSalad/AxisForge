@@ -38,13 +38,18 @@ class AxisForgeRunnerTests(unittest.TestCase):
     def test_stages_uploaded_gcode(self):
         destination = self.runner.stage_upload("uploaded.gcode", BytesIO(b"G1 X2\n"))
         self.assertEqual(destination.read_bytes(), b"G1 X2\n")
-        self.assertIn("uploaded.gcode", self.runner.list_jobs()["jobs"])
+        self.assertRegex(destination.name, r'^uploaded--[0-9a-f]{12}\.gcode$')
+        self.assertIn(destination.name, self.runner.list_jobs()["jobs"])
 
-    def test_rejects_empty_or_existing_uploads(self):
+    def test_rejects_empty_upload_and_versions_repeated_names_without_overwriting(self):
         with self.assertRaises(AxisForgeError):
             self.runner.stage_upload("empty.gcode", BytesIO(b""))
-        with self.assertRaises(AxisForgeError):
-            self.runner.stage_upload("sample.gcode", BytesIO(b"G1 X2\n"))
+        first = self.runner.stage_upload("sample.gcode", BytesIO(b"G1 X2\n"))
+        second = self.runner.stage_upload("sample.gcode", BytesIO(b"G1 X3\n"))
+        self.assertNotEqual(first.name,second.name)
+        self.assertEqual((self.root/'sample.gcode').read_bytes(),b'G1 X1\n')
+        self.assertEqual(first.read_bytes(),b'G1 X2\n')
+        self.assertEqual(second.read_bytes(),b'G1 X3\n')
         self.assertFalse((self.root / "empty.gcode").exists())
 
     def test_rejects_symlink_outside_job_directory(self):

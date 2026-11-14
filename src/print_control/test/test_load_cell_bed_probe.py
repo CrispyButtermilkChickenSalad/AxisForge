@@ -63,9 +63,13 @@ class BedContactTests(unittest.TestCase):
             node = LoadCellBedProbe(GCodeConfig(), MotionConfig(dry_run=True), args, None, ContactOptions())
         point = node.hover(node.points[0])
         q = node.planner.solve(point, node.joints)
-        end = point-np.array([0., 0., .02])
-        motion = node.planner.sampled_line('contact', point, end, q, .2)
-        self.assertLess(np.linalg.norm(node.planner.nozzle_position(motion.positions[-1])-end), .005)
+        for dz, speed in ((-.02, .2), (-.05, 10.), (-.01, 5.), (3., 10.)):
+            with self.subTest(z_distance_mm=dz, speed_mm_s=speed):
+                end = point+np.array([0., 0., dz])
+                # sampled_line checks and retimes joint velocity/acceleration too.
+                motion = node.planner.sampled_line('contact/retract', point, end, q, speed)
+                self.assertLess(np.linalg.norm(node.planner.nozzle_position(motion.positions[-1])-end), .005)
+                self.assertGreaterEqual(motion.times[-1], node.settings.minimum_segment_duration_s)
         self.assertIsNone(node.action); self.assertIsNone(node.speed_publisher)
 
     def test_repeated_contact_records_measured_tip_then_retracts_and_lifts(self):

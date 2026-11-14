@@ -2,6 +2,7 @@
 import io
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ import numpy as np
 
 from print_control.alps_load_calibration import LoadCalibration, sensitive_options
 from print_control.load_calibration_control import LoadCalibrationControl
-from print_control.load_cell_contact import ContactOptions
+from print_control.load_cell_contact import ContactOptions, ContactDetected
 from test_bridge_bed_probe import GuidedProbeHarness
 
 
@@ -17,7 +18,7 @@ class ScaleHarness(LoadCalibration, GuidedProbeHarness):
     def __init__(self, output):
         GuidedProbeHarness.__init__(self, output)
         self.control = LoadCalibrationControl(io.StringIO(),io.StringIO(),clock=lambda:100.)
-        self.actions = [-.5]*9+[-.05]*9+[.5,'finish']
+        self.actions = [10., -10., 1., -1., .1, -.1]+[-.5]*9+[-.05]*9+[.5,'finish']
         self.capture_confirmations = None
 
     def capture_start(self):
@@ -70,7 +71,43 @@ class ScaleRoutineTests(unittest.TestCase):
         self.assertIn('travel limit',probe.step_error(-.05))
         probe.target[2]=105.
         self.assertIn('travel limit',probe.step_error(.001))
-        for bad in (float('nan'),True,0.,-1.):self.assertTrue(probe.step_error(bad))
+        for bad in (float('nan'),True,0.,-2.):self.assertTrue(probe.step_error(bad))
+
+    def test_requested_steps_work_in_both_directions_with_known_clearance(self):
+        probe=object.__new__(LoadCalibration)
+        probe.contact_z=100.;probe.upper_z=125.;probe.lower_z=99.75
+        probe.target=np.array([1.,2.,112.])
+        for step in (10.,1.,.1,.05):
+            for sign in (-1,1):self.assertEqual(probe.step_error(sign*step),'')
+        probe.target[2]=100.1
+        for step in (10.,1.,.1):self.assertTrue(probe.step_error(-step))
+        self.assertEqual(probe.step_error(-.05),'')
+
+    def test_coarse_down_rearms_contact_at_original_unloaded_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe=ScaleHarness(Path(directory)/'unused')
+            probe.capture_start();probe.contact_z=100.;probe.upper_z=125.;probe.lower_z=99.75
+            probe.target[2]=115.;probe.set_baseline();baseline=probe.detector.baseline
+            probe.detector.triggered=True
+            probe.calibration_step(-10.)
+            self.assertEqual(probe.target[2],105.)
+            self.assertFalse(probe.detector.triggered)
+            self.assertEqual(probe.detector.baseline,baseline)
+            self.assertFalse(probe.seeking)
+            self.assertEqual(probe.moves[-1]['speed'],1.)
+
+    def test_coarse_down_rejects_load_and_stops_on_unexpected_contact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            probe=ScaleHarness(Path(directory)/'unused');probe.capture_start()
+            probe.contact_z=100.;probe.upper_z=125.;probe.lower_z=99.75
+            probe.target[2]=115.;probe.set_baseline()
+            with patch.object(probe.detector,'load',return_value=probe.contact_options.threshold):
+                with self.assertRaisesRegex(RuntimeError,'Unload'):probe.calibration_step(-10.)
+            self.assertFalse(probe.moves)
+            with patch.object(probe,'move_z',side_effect=ContactDetected('contact')),patch.object(probe,'cancel_contact') as cancel:
+                with self.assertRaisesRegex(RuntimeError,'Unexpected contact'):probe.calibration_step(-10.)
+                cancel.assert_called_once()
+            self.assertFalse(probe.seeking)
 
     def test_raw_trigger_adapts_to_noise_without_weakening_noise_guard(self):
         options=ContactOptions(trigger_mode='raw')

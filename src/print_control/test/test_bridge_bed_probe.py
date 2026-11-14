@@ -19,7 +19,7 @@ from print_control.load_cell_contact import (
 from print_control.probe_control import EVENT_PREFIX, ProbeControl
 from print_control.bed_probe import grid_points
 from print_control.bed_surface import BedSurface
-from print_control.bridge_bed_probe import BridgeBedProbe, HomingOptions
+from print_control.bridge_bed_probe import BridgeBedProbe, HomingOptions, load_profile
 from print_control.gcode_path import GCodeConfig
 from print_control.load_cell_bed_probe import LoadCellBedProbe, SimulatedAlps
 from print_control.motion_planner import MotionConfig, MotionPlanner
@@ -237,7 +237,7 @@ class GuidedProbeHarness(BridgeBedProbe):
         self.control = ProbeControl(io.StringIO(), io.StringIO(), clock=lambda: 100.)
         self.moves = []; self.confirmed_stages = []; self.touches = []; self.saved = []
         self.reject_stage = None; self.fail_return = False; self.shift_on_confirm = None
-        self.contacts_z = [99.8, 99.81]
+        self.contacts_z = [99.8, 99.81, 99.80]
         self.stop_unconfirmed = False
 
     def capture_start(self):
@@ -273,8 +273,12 @@ class GuidedProbeHarness(BridgeBedProbe):
         return {'nozzle': self.target.copy(), 'joints': self.seed.copy(), 'load': 20500.,
                 'peak_load': 20500., 'tare_counts': 0.}
 
+    def homing_touch(self, *, floor_z, speed_mm_s):
+        return self.touch_once(floor_z=floor_z, speed_mm_s=speed_mm_s)
+
     def retract_contact(self, *, distance_mm=None, speed_mm_s=None):
-        self.move_z(self.target[2]+distance_mm, 'contact retract', speed_mm_s)
+        self.move_z(self.target[2]+distance_mm, 'contact retract',
+                    self.homing.lift_speed_mm_s if speed_mm_s is None else speed_mm_s)
 
     def probe_current(self):
         z = 99.82+self.index*.001
@@ -298,11 +302,14 @@ class GuidedRoutineTests(unittest.TestCase):
     def test_routine_orders_confirmations_contacts_transit_mesh_and_safe_return(self):
         self.probe.run_routine()
         self.assertEqual(self.probe.confirmed_stages, ['surface', 'front_left'])
-        self.assertEqual(len(self.probe.touches), 2)
-        first, second = self.probe.touches
+        self.assertEqual(len(self.probe.touches), 3)
+        first, second, third = self.probe.touches
         self.assertEqual(first['floor'], 85.)
-        self.assertLess(second['speed'], first['speed'])
-        self.assertLess(second['step'], first['step'])
+        self.assertEqual(first['speed'], 10.)
+        self.assertEqual(second['speed'], .2)
+        self.assertEqual(third['speed'], .2)
+        self.assertIsNone(first['step'])
+        self.assertIsNone(second['step'])
         self.assertAlmostEqual(second['floor'], 99.3)
         for touch in self.probe.touches:
             np.testing.assert_equal(touch['xy'], self.probe.initial_xyz[:2])
@@ -315,11 +322,17 @@ class GuidedRoutineTests(unittest.TestCase):
         np.testing.assert_equal(lift['from'][:2], lift['to'][:2])
         self.assertEqual(lift['to'][2], self.probe.initial_xyz[2]+10.)
         self.assertEqual(transit['from'][2], transit['to'][2])
+        self.assertEqual(lift['speed'], 20.)
+        self.assertEqual(transit['speed'], self.probe.settings.max_travel_speed_mm_s)
         np.testing.assert_equal(transit['to'][:2], self.probe.bed_point(self.probe.points[0])[:2])
         for move in self.probe.moves:
             self.assertIn('surface', move['confirmed'])
             if move['name'] in ('mesh hover', 'mesh travel'):
                 self.assertIn('front_left', move['confirmed'])
+            if move['name'] in ('contact retract', 'mesh lift', 'return clearance lift'):
+                self.assertEqual(move['speed'], 20.)
+            if move['name'] in ('mesh travel', 'return XY'):
+                self.assertEqual(move['speed'], self.probe.settings.max_travel_speed_mm_s)
         final = self.probe.moves[-3:]
         self.assertEqual([m['name'] for m in final], ['return clearance lift', 'return XY', 'return starting Z'])
         np.testing.assert_equal(final[0]['from'][:2], final[0]['to'][:2])
@@ -331,6 +344,43 @@ class GuidedRoutineTests(unittest.TestCase):
         self.assertTrue(data['complete']); self.assertTrue(data['homing']['returned_to_start'])
         self.assertEqual(data['load_cell']['trigger_mode'], 'raw')
 
+    def test_rectangular_and_boundary_meshes_finish_only_after_all_points_and_return(self):
+        from print_control.bed_surface import BedSurface
+        for columns, rows in ((2, 2), (2, 9), (9, 9)):
+            with self.subTest(columns=columns, rows=rows):
+                probe = GuidedProbeHarness(self.output)
+                probe.homing = replace(probe.homing, mesh_columns=columns, mesh_rows=rows)
+                probe.args.margin_mm = 30.
+                probe.points = probe.probe_grid()
+                probe.run_routine()
+                self.assertEqual(probe.saved[-2:], [(columns*rows, False), (columns*rows, True)])
+                data = yaml.safe_load(self.output.read_text())
+                self.assertEqual(data['mesh_shape'], {'columns': columns, 'rows': rows})
+                self.assertEqual(len(data['points']), columns*rows)
+                # Every supported map size also fits the printing bed interpolator.
+                surface = BedSurface([r['nozzle_base_mm'][:2] for r in data['points']],
+                                     [r['bed_z_mm'] for r in data['points']], 0.)
+                first = data['points'][0]
+                self.assertAlmostEqual(surface.height(first['nozzle_base_mm'][:2]), first['bed_z_mm'])
+
+    def test_lift_speed_applies_to_mesh_retract_but_not_explicit_scale_release(self):
+        with patch.object(LoadCellBedProbe, 'retract_contact') as retract:
+            BridgeBedProbe.retract_contact(self.probe)
+            retract.assert_called_with(distance_mm=None, speed_mm_s=20.)
+            self.probe.homing = replace(self.probe.homing, lift_speed_mm_s=10.)
+            BridgeBedProbe.retract_contact(self.probe, distance_mm=3.)
+            retract.assert_called_with(distance_mm=3., speed_mm_s=10.)
+            BridgeBedProbe.retract_contact(self.probe, distance_mm=5., speed_mm_s=.5)
+            retract.assert_called_with(distance_mm=5., speed_mm_s=.5)
+
+    def test_xy_uses_printing_travel_speed_with_legacy_override_only_lowering_it(self):
+        self.probe.settings = replace(self.probe.settings, max_travel_speed_mm_s=120.)
+        self.assertEqual(self.probe.xy_travel_speed, 120.)
+        self.probe.homing = replace(self.probe.homing, travel_speed_mm_s=30.)
+        self.assertEqual(self.probe.xy_travel_speed, 30.)
+        self.probe.homing = replace(self.probe.homing, travel_speed_mm_s=200.)
+        self.assertEqual(self.probe.xy_travel_speed, 120.)
+
     def test_declining_surface_confirmation_leaves_robot_and_mesh_untouched(self):
         self.probe.reject_stage = 'surface'
         with self.assertRaisesRegex(RuntimeError, 'declined surface'): self.probe.run_routine()
@@ -341,7 +391,7 @@ class GuidedRoutineTests(unittest.TestCase):
     def test_declining_front_left_confirmation_never_starts_mesh(self):
         self.probe.reject_stage = 'front_left'
         with self.assertRaisesRegex(RuntimeError, 'declined front_left'): self.probe.run_routine()
-        self.assertEqual(len(self.probe.touches), 2); self.assertFalse(self.probe.records)
+        self.assertEqual(len(self.probe.touches), 3); self.assertFalse(self.probe.records)
         self.assertEqual(self.probe.moves[-1]['name'], 'front-left travel')
         self.assertEqual(self.output.read_text(), 'old mesh\n')
 
@@ -352,8 +402,8 @@ class GuidedRoutineTests(unittest.TestCase):
         self.assertFalse(self.probe.moves); self.assertFalse(self.probe.touches)
 
     def test_disagreeing_contacts_prevent_mesh_and_return(self):
-        self.probe.contacts_z = [99.8, 99.1]
-        with self.assertRaisesRegex(RuntimeError, 'contacts disagree'): self.probe.run_routine()
+        self.probe.contacts_z = [99.8, 99.81, 99.1]
+        with self.assertRaisesRegex(ValueError, 'repeatability'): self.probe.run_routine()
         self.assertFalse(self.probe.records); self.assertFalse(self.probe.returned)
         self.assertFalse(any(m['name'] == 'front-left travel' for m in self.probe.moves))
 
@@ -389,10 +439,46 @@ class GuidedRoutineTests(unittest.TestCase):
         self.assertFalse(self.probe.moves)
 
     def test_bounded_homing_configuration_rejects_unlimited_or_reversed_motion(self):
-        for change in ({'max_descent_mm': 1000.}, {'second_speed_mm_s': 1.},
+        for change in ({'max_descent_mm': 1000.}, {'first_speed_mm_s': 10.01},
+                       {'second_speed_mm_s': 10.}, {'first_speed_mm_s': .1},
+                       {'first_speed_mm_s': 0.}, {'second_speed_mm_s': float('inf')},
+                       {'acceleration_mm_s2': 101.}, {'sample_age_s': .3},
+                       {'cancel_timeout_s': 3.}, {'max_stop_travel_mm': 2.},
                        {'second_step_mm': .1}, {'retract_mm': .1},
+                       {'lift_speed_mm_s': 21.}, {'lift_speed_mm_s': 0.},
+                       {'travel_speed_mm_s': float('nan')}, {'travel_speed_mm_s': 0.},
+                       {'mesh_columns': 1}, {'mesh_rows': 10}, {'mesh_rows': 2.5}, {'mesh_columns': True},
                        {'clearance_above_start_mm': float('nan')}, {'heartbeat_timeout_s': 60.}):
             with self.subTest(change=change), self.assertRaises(ValueError): HomingOptions(**change)
+
+    def test_native_profile_applies_homing_speeds_without_speeding_mesh_or_scale(self):
+        config = Path(__file__).resolve().parents[2]/'axisforge_bringup'/'config'
+        contact, homing = load_profile(config/'bridge_bed_probe.yaml')
+        self.assertEqual(homing.first_speed_mm_s, 10.)
+        self.assertEqual(homing.second_speed_mm_s, .2)
+        self.assertEqual(homing.lift_speed_mm_s, 20.)
+        self.assertIsNone(homing.travel_speed_mm_s)
+        self.assertEqual((homing.mesh_columns, homing.mesh_rows), (3, 3))
+        self.assertEqual((homing.first_step_mm, homing.second_step_mm), (.05, .01))
+        self.assertEqual(contact.speed_mm_s, .1)
+        self.assertEqual(contact.samples, 5)
+        self.assertEqual(contact.repeatability_mm, .02)
+        scale, _ = load_profile(config/'alps_load_calibration.yaml')
+        self.assertEqual(scale.speed_mm_s, .1)
+        # Existing customized slower profiles remain valid.
+        self.assertEqual(HomingOptions(first_speed_mm_s=.5, second_speed_mm_s=.1).first_speed_mm_s, .5)
+
+    def test_only_precise_contacts_determine_homed_height(self):
+        self.probe.contacts_z = [98.8, 99.81, 99.80]
+        self.probe.run_routine()
+        self.assertAlmostEqual(self.probe.homed_z, 99.83)
+        self.assertAlmostEqual(self.probe.homing_repeatability_mm, .01)
+
+    def test_mesh_uses_selected_slow_continuous_contact(self):
+        self.probe.homing_touch = lambda **kwargs: kwargs
+        result = self.probe.mesh_touch()
+        self.assertEqual(result['speed_mm_s'], self.probe.contact_options.speed_mm_s)
+        self.assertEqual(result['floor_z'], 97.)
 
     def test_unresolved_trajectory_stop_uses_dashboard_stop_and_does_not_resume(self):
         self.probe.config = replace(self.probe.config, dry_run=False)

@@ -656,21 +656,83 @@ Leave room for the subsequent lift and mesh travel before starting.
 1. Press **Home & probe bed**. Confirm that the flat build surface is beneath the
    nozzle, and that the nozzle is clean, cool, clear of the surface and unloaded.
    This confirmation establishes the session's unloaded sensor baseline.
-2. The arm descends in **Z only**, initially at **0.5 mm/s** in **0.05 mm** steps,
+2. The arm descends continuously in **Z only**, accelerating to **10 mm/s**,
    stopping on sustained load detection. Descent is bounded to **20 mm** below
    the saved starting position; failure to find contact stops the routine.
-3. It retracts **3 mm**, verifies that the load clears, and probes again at
-   **0.1 mm/s** in **0.01 mm** steps. The slower contact establishes the bed height;
-   disagreement between the two contacts rejects the result.
+3. It retracts **3 mm**, verifies that the load clears, and makes **two precision
+   contacts at 0.2 mm/s**, retracting and checking for released load between them.
+   Only these slow contacts determine bed height. They must agree within the
+   selected repeatability tolerance; the fast touch is an approximate location.
 4. It lifts vertically to **10 mm above the original starting Z**, then moves in
    XY to the existing first mesh point: G-code **X30 Y30** with the default grid,
    transformed using the configured bed origin and nozzle TCP. The dashboard waits
    for confirmation that this is the intended **front-leftmost mesh point**.
-5. After that confirmation, it automatically measures the nine-point serpentine
-   grid. Each point uses three contacts; the default accepted Z spread is **0.05 mm**.
+5. After that confirmation, it automatically measures the selected serpentine
+   grid (default **3×3**, selectable **2–9 points per axis**) at **0.1 mm/s**. Each point uses **five contacts**; the default accepted Z
+   spread is **0.02 mm**. The median measured contact is saved.
 6. It lifts to a clear height, returns in XY, then moves in Z to the **saved starting
    nozzle position and orientation**. This returns to the pose captured at the
    beginning, not a separate pendant-defined Home pose.
+
+Upward homing and mesh moves use **20 mm/s** by default, including the 0.5 mm
+retraction between mesh contacts, the 3 mm homing retraction, and clearance lifts.
+The dashboard can adjust this independently from downward probing (1–20 mm/s).
+XY moves at clearance height inherit AxisForge’s `max_travel_speed_mm_s`, currently
+**120 mm/s** in `ur_master.yaml`, instead of the old bridge-specific 5 mm/s.
+Travel still accelerates/decelerates and respects joint limits; very short lifts
+may finish before reaching the requested speed. A legacy `homing.travel_speed_mm_s`
+can lower XY speed but cannot exceed the AxisForge limit.
+
+Mesh X/Y counts are independent integers from **2 to 9** (4–81 points total).
+Changing density preserves the saved bed dimensions, edge margin (30 mm by default)
+and front-left start, with evenly spaced serpentine rows. The saved map includes its grid shape;
+a denser grid takes longer because every point receives the selected repeat contacts.
+
+Use the **Build surface** fields in the same card to set bed **width X**, **depth Y**,
+and **probe edge margin**. A W×D bed with margin m probes X=m..W−m and Y=m..D−m
+using the selected point counts. Zero margin reaches the physical edges; the
+margin must be less than half the smaller dimension. Resize only to the actual
+flat surface under the nozzle. Saving keeps the physical front-left corner fixed
+by compensating the legacy center-mode X/Y offsets; the nozzle TCP is unchanged.
+After resizing, run Home & probe bed and repeat preflight. Existing mesh files
+are retained, but a map recorded for different dimensions is rejected for printing.
+
+Both standalone and synchronized AxisForge preflight reject resolved G-code XY
+outside **X=0..width, Y=0..depth**, including start purge lines, travel, and end
+parking. Relative moves, inch units and G92 offsets are resolved before checking;
+a configured bed map can impose tighter coverage limits. This is an XY build-area
+check, in addition to existing robot reach, joint and path checks.
+
+Each homing pass uses one trajectory with smooth acceleration/deceleration ramps
+and a constant-speed middle at the selected speed. It does not stop at individual
+waypoints or wait for settled samples during descent. ALPS is monitored throughout;
+contact cancels the trajectory, and fresh stationary feedback is required before
+recording height or retracting. Contact close to the starting position can happen
+during acceleration. An infeasible path or joint limit rejects the pass instead
+of silently slowing its cruise. Mesh approaches also use continuous, slow motion;
+settling and repeated measurements occur at contact. Scale calibration retains
+its **0.1 mm/s** stepped contact search. Legacy `first_step_mm` and
+`second_step_mm` fields are accepted but are not used by continuous homing.
+
+Use **Setup & calibration → Home & probe bed → Homing and mesh settings** to save coarse
+search speed, precision rehoming speed, upward speed, mesh speed, X/Y point counts,
+readings per mesh point, and repeatability tolerance. Settings can be edited with hardware disconnected and
+apply on the next run. Saving is blocked during robot operations and invalidates
+job preflight. Revision checking prevents one browser from overwriting another's
+changes. Reload after a conflict. The profile is `bridge_bed_probe.yaml`; its
+acceleration and safety limits remain available for deliberate file-based tuning.
+Lower speed and repeatable readings reduce measurement variation; the repeatability
+setting does not certify absolute accuracy or compensate hotend deflection.
+
+Continuous homing rejects latest ALPS samples older than **150 ms**, uses a
+**200 ms** action-cancellation deadline with independent UR Stop fallback, and
+rejects observed travel beyond **0.5 mm after host detection**. These are software
+rejection limits, not verified physical stopping distances or force limits. The
+observed ALPS delivery is about 100 ms per batch: at 10 mm/s the nozzle can travel
+about 1 mm before a contact report arrives, plus stopping travel. Commission actual
+contact and stopping distance under supervision. Different pass speeds can affect
+post-stop deflection and repeatability. Stop acknowledgement time and observed
+post-detection travel are recorded with the homing readings.
 
 The active bed map is replaced only after the entire grid **and the return move**
 succeed. Partial results remain in `bed_probe.pending.yaml`; the previous map is
@@ -840,9 +902,11 @@ upload/preflight/start workflow is in the next tab. Complete these steps:
    then confirm separately. The routine descends along base Z at **0.1 mm/s** in
    **0.01 mm** steps, stops on raw ALPS contact, and lifts **5 mm** at 0.5 mm/s.
 3. Tare the weighing scale and confirm. Use **Up / Down** for individual
-   0.001/0.01/0.05 mm steps; 0.5 mm descending steps are permitted only while
-   staying at least 0.5 mm above detected contact. Travel is bounded between the
-   retracted height and 0.25 mm below detected contact. Rotation and XY remain
+   **10, 1, 0.1 or 0.05 mm** Z steps; 0.5, 0.01 and 0.001 mm are also available.
+   Downward steps larger than 0.05 mm must end at least 0.5 mm above detected
+   contact. Travel is bounded to **25 mm above contact and 0.25 mm below it**.
+   Coarse clearance moves use 1 mm/s and stop if unexpected contact is detected;
+   fine/load-release moves use 0.1 mm/s. Rotation and XY remain
    fixed. Obtain two distinct, stable scale readings and enter each measured
    weight in **ALPS Logger → Calibration** alongside its sensor reading. Return
    to Setup to adjust the second load. Do not tare ALPS while loaded.
@@ -868,6 +932,21 @@ The existing sensor/robot watchdogs, heater-off checks, process lock and indepen
 stop fallback apply to calibration. There is no queued jogging or automatic retry
 of motion. Abort stops without a return move. **Simulate scale routine** exercises
 the confirmations and synthetic contact without contacting either device.
+
+### Nozzle orientation and pendant settings
+
+The saved AxisForge nominal orientation is **roll 180°, pitch 0°, yaw 90°** in its
+robot Base frame. G-code `A=0 B=0 C=0` means no rotation added to that orientation;
+it does not mean all robot joints, or all pendant TCP angles, are zero. Guided
+probing rejects a tilted starting tool and preserves the measured near-nominal
+orientation throughout its Z moves. Use the pendant for initial XY positioning,
+upright orientation, and the robot installation's measured TCP/payload setup.
+
+UR's default orientation fields use a rotation vector (axis-angle, radians),
+while AxisForge uses roll/pitch/yaw in degrees. The pendant's selected feature and
+active TCP also affect its displayed pose. Do not copy AxisForge's degree values
+into rotation-vector fields or zero the installation TCP. See the official
+[UR Pose Editor documentation](https://www.universal-robots.com/manuals/EN/HTML/SW5_21/Content/prod-usr-man/complianceUR3e/SW_sections/first_program/pose_editor.htm).
 
 The `robot-connection` container supervises only the PC driver, separate from
 `bridge`, so refreshing/restarting the web dashboard does not shut down that driver.

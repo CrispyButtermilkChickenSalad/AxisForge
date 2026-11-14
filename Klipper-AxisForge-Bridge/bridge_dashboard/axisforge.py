@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,8 @@ class AxisForgeRunner:
         return path.resolve(strict=True)
 
     def _validate_job_name(self, name):
-        if not name or name in (".", "..") or "/" in name or "\\" in name:
+        if (not name or name in (".", "..") or "/" in name or "\\" in name or
+                any(ord(c) < 32 for c in name)):
             raise AxisForgeError("Choose a G-code file from the configured job list")
         if not name.lower().endswith(".gcode"):
             raise AxisForgeError("Only .gcode files are accepted")
@@ -73,10 +75,6 @@ class AxisForgeRunner:
             raise AxisForgeError("AXISFORGE_GCODE_ROOT is not configured")
         if not root.is_dir():
             raise AxisForgeError("The configured AxisForge G-code directory does not exist")
-        destination = root / name
-        if os.path.lexists(destination):
-            raise AxisForgeError("A G-code file with that name already exists")
-
         temporary_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -89,9 +87,18 @@ class AxisForgeRunner:
                 os.fsync(staged.fileno())
             if os.path.getsize(temporary_path) == 0:
                 raise AxisForgeError("The uploaded G-code file is empty")
-            if os.path.lexists(destination):
-                raise AxisForgeError("A G-code file with that name already exists")
-            os.replace(temporary_path, destination)
+            # Every upload is a distinct version on both hosts. Never overwrite
+            # a previous job or let a same-name upload reuse its preflight.
+            stem = name[:-6].encode('utf-8')[:160].decode('utf-8', errors='ignore')
+            for _ in range(10):
+                destination = root / (stem+'--'+uuid.uuid4().hex[:12]+'.gcode')
+                try:
+                    os.link(temporary_path, destination)  # Atomic no-clobber publication.
+                    break
+                except FileExistsError:
+                    continue
+            else:
+                raise AxisForgeError('Could not allocate a unique G-code version')
         except AxisForgeError:
             raise
         except OSError as error:

@@ -37,7 +37,7 @@ class BedSurface:
         self.orientation_note = ''
 
     @classmethod
-    def load(cls, path, tcp_offset_mm, nozzle_rpy_deg, extrapolation_mm):
+    def load(cls, path, tcp_offset_mm, nozzle_rpy_deg, extrapolation_mm, *, expected_bed_size=None):
         """Reuse upright Base-frame measurements with the same calibrated nozzle TCP."""
         path = Path(path).expanduser().resolve()
         if not path.is_file():
@@ -46,6 +46,12 @@ class BedSurface:
         data = yaml.safe_load(path.read_text())
         if data.get('simulated') is True or data.get('complete') is False:
             raise ValueError(f'{path.name}: simulated or incomplete bed maps cannot be used for printing')
+        if expected_bed_size is not None:
+            measured_size = np.asarray((data.get('transform') or {}).get('bed_size_mm'), dtype=float)
+            if (measured_size.shape != (2,) or not np.all(np.isfinite(measured_size)) or
+                    not np.allclose(measured_size, expected_bed_size, atol=.001, rtol=0)):
+                raise ValueError('Bed dimensions changed or mesh dimensions are missing; '
+                                 'run Home & probe bed for the configured build surface')
         orientation_note = ''
         for name, current in (('tcp_offset_mm', tcp_offset_mm),
                               ('nozzle_rpy_deg', nozzle_rpy_deg)):

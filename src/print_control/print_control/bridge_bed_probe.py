@@ -18,40 +18,64 @@ from std_srvs.srv import Trigger
 from ur_dashboard_msgs.msg import SafetyMode
 import yaml
 
-from print_control.bed_probe import load_configs, rounded
+from print_control.bed_probe import grid_points, load_configs, rounded
 from print_control.load_cell_bed_probe import LoadCellBedProbe, sensor_setup
-from print_control.load_cell_contact import ContactOptions, finite
+from print_control.load_cell_contact import ContactOptions, finite, repeat_contact
 from print_control.probe_control import ProbeControl
+from print_control.continuous_probe import ContinuousHoming
+from print_control.load_cell_contact import ContactDetected
 
 
 @dataclass(frozen=True)
 class HomingOptions:
-    first_speed_mm_s: float = .5
-    second_speed_mm_s: float = .1
+    first_speed_mm_s: float = 10.
+    second_speed_mm_s: float = .2
+    # Accepted for compatibility with old profiles; continuous passes do not step.
     first_step_mm: float = .05
     second_step_mm: float = .01
+    acceleration_mm_s2: float = 50.
+    sample_age_s: float = .15
+    cancel_timeout_s: float = .2
+    max_stop_travel_mm: float = .5
     retract_mm: float = 3.
     max_descent_mm: float = 20.
     max_retest_difference_mm: float = .5
     clearance_above_start_mm: float = 10.
-    travel_speed_mm_s: float = 5.
+    lift_speed_mm_s: float = 20.
+    # Optional legacy override; otherwise inherit AxisForge's XY travel speed.
+    travel_speed_mm_s: float = None
+    mesh_columns: int = 3
+    mesh_rows: int = 3
     confirmation_timeout_s: float = 300.
     heartbeat_timeout_s: float = 5.
     confirmation_pose_tolerance_mm: float = .1
 
     def __post_init__(self):
-        if not all(finite(v) and v > 0 for v in vars(self).values()):
+        if not all(finite(v) and v > 0 for k, v in vars(self).items()
+                   if k != 'travel_speed_mm_s'):
             raise ValueError('Homing settings must be finite positive numbers')
-        if not 0 < self.second_speed_mm_s < self.first_speed_mm_s <= .5:
-            raise ValueError('Homing speeds require second < first <= 0.5 mm/s')
+        if self.travel_speed_mm_s is not None and (not finite(self.travel_speed_mm_s) or self.travel_speed_mm_s <= 0):
+            raise ValueError('XY travel override must be a finite positive speed')
+        if not 1 <= self.lift_speed_mm_s <= 20:
+            raise ValueError('Upward speed must be 1..20 mm/s')
+        if any(type(v) is not int or not 2 <= v <= 9 for v in (self.mesh_columns, self.mesh_rows)):
+            raise ValueError('Mesh columns and rows must be integers from 2 to 9')
+        if not 0 < self.second_speed_mm_s < self.first_speed_mm_s <= 10.:
+            raise ValueError('Homing speeds require second < first <= 10 mm/s')
         if not .001 <= self.second_step_mm < self.first_step_mm <= .05:
             raise ValueError('Homing steps require 0.001 <= second < first <= 0.05 mm')
+        if not 1 <= self.acceleration_mm_s2 <= 100:
+            raise ValueError('Continuous homing acceleration must be 1..100 mm/s^2')
+        if not .02 <= self.sample_age_s <= .2 or not .05 <= self.cancel_timeout_s <= .25:
+            raise ValueError('Homing sample age must be 20..200 ms; cancellation 50..250 ms')
+        if not .05 <= self.max_stop_travel_mm <= 1.:
+            raise ValueError('Observed homing stop travel must be 0.05..1 mm')
         if not 1 <= self.retract_mm <= 5 or not self.retract_mm < self.max_descent_mm <= 50:
             raise ValueError('Homing retract must be 1..5 mm, and descent > retract and <= 50 mm')
         if self.max_retest_difference_mm >= self.retract_mm:
             raise ValueError('Homing repeat difference must be less than the retract')
-        if not 5 <= self.clearance_above_start_mm <= 50 or self.travel_speed_mm_s > 10:
-            raise ValueError('Travel clearance must be 5..50 mm; speed at most 10 mm/s')
+        if not 5 <= self.clearance_above_start_mm <= 50:
+            raise ValueError('Travel clearance must be 5..50 mm')
         if self.heartbeat_timeout_s > 5 or self.confirmation_pose_tolerance_mm > .2:
             raise ValueError('Heartbeat timeout must be <= 5 s; confirmation pose tolerance <= 0.2 mm')
 
@@ -67,7 +91,21 @@ def load_profile(path):
     return ContactOptions(**data.get('contact', {})), HomingOptions(**data.get('homing', {}))
 
 
-class BridgeBedProbe(LoadCellBedProbe):
+class BridgeBedProbe(ContinuousHoming, LoadCellBedProbe):
+    def probe_grid(self):
+        return grid_points(self.settings.bed_size_mm, self.args.margin_mm,
+                           self.homing.mesh_columns, self.homing.mesh_rows)
+
+    @property
+    def xy_travel_speed(self):
+        return min(self.settings.max_travel_speed_mm_s,
+                   self.homing.travel_speed_mm_s or self.settings.max_travel_speed_mm_s)
+
+    def retract_contact(self, *, distance_mm=None, speed_mm_s=None):
+        # Includes the small retraction between every repeated mesh contact.
+        return super().retract_contact(distance_mm=distance_mm,
+            speed_mm_s=self.homing.lift_speed_mm_s if speed_mm_s is None else speed_mm_s)
+
     def __init__(self, settings, motion, args, source, options, homing, control):
         self.control, self.homing = control, homing
         self.monitor_robot = False
@@ -106,7 +144,12 @@ class BridgeBedProbe(LoadCellBedProbe):
 
     def check_interrupted(self):
         self.control.check()
-        super().check_interrupted()
+        self.check_continuous_homing()
+        try:
+            super().check_interrupted()
+        except ContactDetected:
+            self.capture_continuous_trigger()
+            raise
         if self.monitor_robot:
             reason = self.robot_reason()
             if reason: raise RuntimeError(reason)
@@ -138,6 +181,11 @@ class BridgeBedProbe(LoadCellBedProbe):
         actual_rpy = tuple(float(v) for v in SE3.Rt(rotation, np.zeros(3)).rpy(unit='deg', order='zyx'))
         self.config = replace(self.config, nozzle_rpy_deg=actual_rpy)
         self.planner.config, self.planner.rotation = self.config, rotation.copy()
+        # sampled_line derives rotations from its settings, not only .rotation.
+        # Preserve the measured tool orientation on subsequent Z/XY moves too.
+        self.settings = replace(self.settings, nozzle_roll_deg=actual_rpy[0],
+                                nozzle_pitch_deg=actual_rpy[1], wrist_angle=actual_rpy[2])
+        self.planner.settings, self.planner.orientation = self.settings, (0., 0., 0.)
         self.target, self.seed = nozzle.copy(), joints.copy()
         self.start_xyz, self.start_joints = nozzle.copy(), joints.copy()
 
@@ -169,30 +217,38 @@ class BridgeBedProbe(LoadCellBedProbe):
         self.capture_start()
         self.confirm_position('surface',
             'Confirm a flat build surface is under the upright nozzle, with the nozzle clean, cool, '
-            'and clear of the surface (unloaded). Confirmation starts vertical homing.', progress=0.)
+            'and clear of the surface (unloaded). Confirmation starts continuous vertical homing '
+            'at %g mm/s, followed by two precision contacts at %g mm/s, with acceleration ramps.' %
+            (self.homing.first_speed_mm_s, self.homing.second_speed_mm_s), progress=0.)
         # In raw mode this is the first tare, made only after explicit unloaded confirmation.
         self.set_baseline()
         floor = self.start_xyz[2]-self.homing.max_descent_mm
-        self.emit_stage('homing_fast', 'Finding the surface with a slow Z-only descent', progress=.03)
-        first = self.touch_once(floor_z=floor, speed_mm_s=self.homing.first_speed_mm_s,
-                                step_mm=self.homing.first_step_mm)
-        self.retract_contact(distance_mm=self.homing.retract_mm, speed_mm_s=self.homing.first_speed_mm_s)
-        self.set_baseline()
-        self.emit_stage('homing_slow', 'Repeating contact at the slower homing speed', progress=.08)
-        second = self.touch_once(floor_z=max(floor, first['nozzle'][2]-self.homing.max_retest_difference_mm),
-                                 speed_mm_s=self.homing.second_speed_mm_s, step_mm=self.homing.second_step_mm)
-        if abs(second['nozzle'][2]-first['nozzle'][2]) > self.homing.max_retest_difference_mm:
-            raise RuntimeError('The two homing contacts disagree; bed position was not accepted')
-        self.homing_readings = [first, second]
-        self.homed_z = float(second['nozzle'][2])+self.contact_options.contact_offset_mm
-        self.retract_contact(distance_mm=self.homing.retract_mm, speed_mm_s=self.homing.first_speed_mm_s)
+        self.emit_stage('homing_fast', 'Finding the surface with continuous Z motion at %g mm/s' %
+                        self.homing.first_speed_mm_s, progress=.03)
+        first = self.homing_touch(floor_z=floor, speed_mm_s=self.homing.first_speed_mm_s)
+        self.retract_contact(distance_mm=self.homing.retract_mm)
+        fine = []
+        for index in range(2):
+            self.set_baseline()
+            self.emit_stage('homing_slow', 'Precision contact %d of 2 at %g mm/s' %
+                            (index+1, self.homing.second_speed_mm_s), progress=.06+.025*index)
+            fine.append(self.homing_touch(
+                floor_z=max(floor, first['nozzle'][2]-self.homing.max_retest_difference_mm),
+                speed_mm_s=self.homing.second_speed_mm_s))
+            self.retract_contact(distance_mm=self.homing.retract_mm)
+        # The fast touch locates the surface approximately. Never average its
+        # speed-dependent stopping deflection into the accurate bed height.
+        selected, spread = repeat_contact(fine, self.contact_options.repeatability_mm)
+        self.homing_readings = [first, *fine]
+        self.homing_repeatability_mm = spread
+        self.homed_z = float(selected['nozzle'][2])+self.contact_options.contact_offset_mm
         self.settings = replace(self.settings, z_offset=self.homed_z)
         clearance = float(self.start_xyz[2])+self.homing.clearance_above_start_mm
         self.emit_stage('moving_front_left', 'Lifting before moving to the first mesh point',
                         progress=.12, homed_z_mm=self.homed_z, clearance_z_mm=clearance)
-        self.move_z(clearance, 'homing clearance lift', self.homing.travel_speed_mm_s)
+        self.move_z(clearance, 'homing clearance lift', self.homing.lift_speed_mm_s)
         first_xy = self.bed_point(self.points[0])[:2]
-        self.line_to(np.array([*first_xy, clearance]), 'front-left travel', self.homing.travel_speed_mm_s)
+        self.line_to(np.array([*first_xy, clearance]), 'front-left travel', self.xy_travel_speed)
         self.confirm_position('front_left',
             'Confirm the nozzle is above the first mesh point and this is the front-leftmost point of the mesh. '
             'Confirmation starts the automatic grid scan.', progress=.15,
@@ -209,24 +265,29 @@ class BridgeBedProbe(LoadCellBedProbe):
         self.returned = True
         self.save()
 
+    def mesh_touch(self):
+        # One slow, monitored approach instead of hundreds of stop/settle steps.
+        floor = self.bed_point(self.points[self.index])[2]-self.args.floor_mm
+        return self.homing_touch(floor_z=floor, speed_mm_s=self.contact_options.speed_mm_s)
+
     def go_to(self, index):
         self.lift()
         self.index = index
         target = self.hover(self.points[index])
         target[2] = max(target[2], self.target[2])
-        self.line_to(target, 'mesh travel', self.homing.travel_speed_mm_s)
+        self.line_to(target, 'mesh travel', self.xy_travel_speed)
 
     def lift(self):
         height = float(self.hover(self.points[self.index])[2])
         if self.target[2] < height:
-            self.move_z(height, 'mesh lift', self.homing.travel_speed_mm_s)
+            self.move_z(height, 'mesh lift', self.homing.lift_speed_mm_s)
 
     def return_to_start(self):
         clearance = max(float(self.start_xyz[2])+self.homing.clearance_above_start_mm,
                         max(r['bed_z_mm'] for r in self.records.values())+self.config.clearance_mm,
                         float(self.target[2]))
-        self.move_z(clearance, 'return clearance lift', self.homing.travel_speed_mm_s)
-        self.line_to(np.array([*self.start_xyz[:2], clearance]), 'return XY', self.homing.travel_speed_mm_s)
+        self.move_z(clearance, 'return clearance lift', self.homing.lift_speed_mm_s)
+        self.line_to(np.array([*self.start_xyz[:2], clearance]), 'return XY', self.xy_travel_speed)
         self.move_z(float(self.start_xyz[2]), 'return starting Z', self.homing.first_speed_mm_s)
         actual, joints = self.nozzle_now()
         if np.linalg.norm(actual-self.start_xyz) > .2:
@@ -235,11 +296,15 @@ class BridgeBedProbe(LoadCellBedProbe):
 
     def measurement_data(self):
         data = super().measurement_data()
+        data['mesh_shape'] = {'columns': self.homing.mesh_columns, 'rows': self.homing.mesh_rows}
         data['upright_tolerance_deg'] = min(.2, self.config.orientation_tolerance_deg)
         data['homing'] = {'starting_nozzle_base_mm': rounded(self.start_xyz), 'homed_z_mm': self.homed_z,
                           'returned_to_start': self.returned,
+                          'fine_repeatability_mm': getattr(self, 'homing_repeatability_mm', None),
                           'contacts': [{'nozzle_base_mm': rounded(r['nozzle']), 'load': float(r['load']),
-                                        'unit': self.contact_options.unit} for r in self.homing_readings]}
+                                        'unit': self.contact_options.unit,
+                                        **{k: float(r[k]) for k in ('speed_mm_s', 'stop_ack_s', 'stop_travel_mm')
+                                           if k in r}} for r in self.homing_readings]}
         return data
 
     def save(self, *, promote=True):
@@ -279,7 +344,8 @@ def parse_args(argv):
     parser.add_argument('--moonraker-url')
     parser.add_argument('--alps-url')
     parser.add_argument('--load-cell', default='load_cell_probe')
-    parser.add_argument('--margin-mm', type=float, default=30.)
+    parser.add_argument('--margin-mm', type=float, default=None,
+                        help='Override bed_probe_margin_mm from the AxisForge configuration')
     parser.add_argument('--floor-mm', type=float, default=3.)
     parser.add_argument('--dry-run', action='store_true')
     args = parser.parse_args(argv)

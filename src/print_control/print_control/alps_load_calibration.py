@@ -13,7 +13,7 @@ from rclpy.signals import SignalHandlerOptions
 from print_control.bed_probe import load_configs, rounded
 from print_control.bridge_bed_probe import BridgeBedProbe, load_profile, parse_args
 from print_control.load_cell_bed_probe import sensor_setup
-from print_control.load_cell_contact import stable_baseline
+from print_control.load_cell_contact import stable_baseline, ContactDetected, ContactDetector
 from print_control.load_calibration_control import LoadCalibrationControl, STEP_SIZES
 
 
@@ -46,7 +46,7 @@ class LoadCalibration(BridgeBedProbe):
         self.contact_z = float(contact['nozzle'][2])
         self.emit_stage('retracting', 'Lifting 5 mm to release the weighing scale.')
         self.retract_contact(distance_mm=5., speed_mm_s=.5)
-        self.upper_z = float(self.target[2])
+        self.upper_z = self.contact_z+25.
         self.lower_z = self.contact_z-.25
         self.confirm_position('tare',
             'The nozzle has lifted 5 mm and the load has cleared. Tare the weighing scale to zero, '
@@ -73,15 +73,42 @@ class LoadCalibration(BridgeBedProbe):
                 self.control.emit('step_rejected', error)
                 continue
             self.control.emit('stepping', 'Moving Z by %+.3f mm' % delta)
-            self.move_z(float(self.target[2])+delta, 'scale baby step', .1)
+            self.calibration_step(delta)
             self.detector.update(self.window())
+
+    def calibration_step(self, delta):
+        error = self.step_error(delta)
+        if error:
+            raise ValueError(error)
+        # Coarse downward clicks are clearance motion only; stop on any
+        # unexpected contact rather than permitting them to build load.
+        clearance = float(self.target[2]) >= self.contact_z+.5
+        speed = 1. if abs(delta) > .05 and clearance else .1
+        if delta < -.05:
+            samples = self.window()
+            if max(abs(self.detector.load(s.counts)) for s in samples) >= self.contact_options.threshold*.25:
+                raise RuntimeError('Unload the scale before a coarse downward Z step')
+            # The initial contact is latched. Rearm detection at the SAME
+            # unloaded reference; never tare away an existing load.
+            baseline = self.detector.baseline
+            self.detector = ContactDetector(baseline, self.source.sensor.get('counts_per_gram'),
+                                            self.contact_options)
+            self.detector.last_sequence = samples[-1].sequence
+        self.seeking = delta < -.05
+        try:
+            self.move_z(float(self.target[2])+delta, 'scale baby step', speed)
+        except ContactDetected as error:
+            self.cancel_contact()
+            raise RuntimeError('Unexpected contact during a coarse Z step; restart scale calibration') from error
+        finally:
+            self.seeking = False
 
     def step_error(self, delta):
         if type(delta) not in (int, float) or abs(delta) not in STEP_SIZES:
             return 'Invalid baby-step distance'
         end = float(self.target[2])+delta
         if not self.lower_z-1e-8 <= end <= self.upper_z+1e-8:
-            return 'Step exceeds the calibration travel limit (5 mm above contact to 0.25 mm below).'
+            return 'Step exceeds the calibration travel limit (25 mm above contact to 0.25 mm below).'
         if delta < -.05 and end+1e-8 < self.contact_z+.5:
             return 'Use 0.05 mm or smaller steps within 0.5 mm of contact.'
         return ''

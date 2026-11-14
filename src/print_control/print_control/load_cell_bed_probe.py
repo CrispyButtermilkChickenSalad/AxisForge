@@ -213,7 +213,7 @@ class LoadCellBedProbe(BedProbe):
         try:
             for _ in range(self.contact_options.samples):
                 self.set_baseline()
-                readings.append(self.touch_once())
+                readings.append(self.mesh_touch())
                 self.retract_contact()
             selected, spread = repeat_contact(readings, self.contact_options.repeatability_mm)
             self.lift()
@@ -235,6 +235,9 @@ class LoadCellBedProbe(BedProbe):
         self.save()
         print('Point %d: bed Z %.4f mm; repeat spread %.4f mm (%d/%d recorded)' %
               (self.index+1, self.records[self.index]['bed_z_mm'], spread, len(self.records), len(self.points)))
+
+    def mesh_touch(self):
+        return self.touch_once()
 
     def save(self, *, promote=True):
         data = self.measurement_data()

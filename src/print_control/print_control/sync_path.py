@@ -168,6 +168,14 @@ class TimedPath:
     def __init__(self, config_path, plan, seed, report=lambda *_:None, cancelled=lambda:False):
         validate_plan(plan)
         settings, motion, self.config_hash = configuration(config_path)
+        settings.validate()
+        settings.check_bed_bounds(plan['entry'])
+        for op in plan['operations']:
+            if op['kind'] == 'chunk':
+                for move in op['moves']:
+                    for key in ('start', 'end', 'reference_start', 'reference_end'):
+                        if key in move:
+                            settings.check_bed_bounds(move[key], move.get('source_line'))
         if settings.bed_probe_file:
             orientations = {tuple(plan['entry'][3:])}
             for op in plan['operations']:

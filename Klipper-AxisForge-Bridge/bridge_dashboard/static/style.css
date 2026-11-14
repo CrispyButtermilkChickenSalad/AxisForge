@@ -148,5 +148,11 @@ footer { padding: 0 20px 28px; color: #718096; text-align: center; font-size: .7
 .tcp-fields { margin: 16px 0 8px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
 .tcp-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .tcp-grid input { width: 100%; }
+.probing-fields { margin: 16px 0 8px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
+.probing-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
+.probing-grid input { width: 100%; }
+#probing-form { margin-top: 22px; }
+#probing-form h3 { margin: 0; }
 @media (max-width: 560px) { .tcp-grid { grid-template-columns: 1fr; } }
+@media (max-width: 650px) { .probing-grid { grid-template-columns: 1fr; } }
 .safety-card { max-width: 1152px; margin: 20px auto; }
