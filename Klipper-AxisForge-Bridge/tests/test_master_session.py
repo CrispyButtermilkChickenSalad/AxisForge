@@ -9,7 +9,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 import unittest
 
-from klipper_extras.axisforge_sync import AxisForgeSync
+from klipper_extras.axisforge_sync import AxisForgeSync, HostClockRate
 from test_schedule import ENTRY
 
 
@@ -97,6 +97,8 @@ def make_master(root,clock=None):
     printer=Printer(root,clock)
     master=AxisForgeSync(Config(printer))
     master._ready()
+    # Test reactors already use Python MONOTONIC, not Klipper's RAW clock.
+    master.host_clock_rate=SimpleNamespace(sample=lambda:1.)
     return master,printer
 
 
@@ -107,6 +109,24 @@ def call(master,action,**data):
 
 
 class MasterTests(unittest.TestCase):
+    def test_host_clock_rate_accounts_for_linux_frequency_discipline(self):
+        now=[100.]
+        rate=.999986453
+        clock=HostClockRate(lambda:500.+now[0]*rate,lambda:now[0])
+        self.assertIsNone(clock.sample())
+        now[0]+=2.
+        self.assertAlmostEqual(clock.sample(),rate,places=11)
+        for _ in range(200):
+            now[0]+=.2
+            self.assertAlmostEqual(clock.sample(),rate,places=10)
+        self.assertLessEqual(len(clock.points),152)
+
+    def test_host_clock_rate_rejects_an_invalid_rate(self):
+        now=[100.]
+        clock=HostClockRate(lambda:2*now[0],lambda:now[0])
+        now[0]+=2.
+        self.assertIsNone(clock.sample())
+
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.path=Path(self.temp.name)/'test.gcode'
@@ -129,6 +149,20 @@ class MasterTests(unittest.TestCase):
         self.assertAlmostEqual(move.end_pos[3]-move.start_pos[3],.1)
         with self.assertRaises(ValueError):
             call(self.master,'commit',session=self.session,token=reservation['token'])
+
+    def test_clock_exposes_print_time_rate_without_scheduling_actuators(self):
+        self.master.mcu.estimated_print_time=lambda t:1000.+1.0000365*t
+        clock=call(self.master,'clock')
+        self.assertAlmostEqual(clock['print_time_rate'],1.0000365)
+        self.assertEqual(clock['eventtime'],self.now)
+        self.assertTrue(call(self.master,'capabilities')['clock_rate_supported'])
+        self.assertFalse(self.printer.queued)
+        self.assertEqual(self.printer.heater.target,0.)
+    def test_native_probe_blocks_both_new_preflight_and_lease_acquisition(self):
+        self.printer.objects['axisforge_probe'] = SimpleNamespace(is_busy=lambda: True)
+        for action in ('prepare', 'acquire'):
+            with self.subTest(action=action), self.assertRaisesRegex(ValueError, 'ALPS probing owns'):
+                call(self.master, action, session=self.session)
 
     def test_expired_lease_switches_heaters_off_without_motion(self):
         call(self.master,'heat',session=self.session,targets={'extruder':200.})

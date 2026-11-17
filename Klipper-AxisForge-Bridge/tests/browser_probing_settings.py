@@ -19,9 +19,9 @@ def main():
                 configured_heaters=['extruder'], corner_policies=['exact'], motion_defaults=motion,
                 clock_options_supported=True, clock_profiles=profiles(), clock_defaults=clock_options(),
                 clock_options=clock_options(), clock_guidance_distance_mm=.1, checks=[])
-    settings = dict(first_speed_mm_s=10., second_speed_mm_s=.2, mesh_speed_mm_s=.1,
-                    mesh_samples=5, mesh_repeatability_mm=.02, lift_speed_mm_s=20.,
-                    mesh_columns=3, mesh_rows=3)
+    settings = dict(first_speed_mm_s=5., max_descent_mm=350., second_speed_mm_s=.2, mesh_speed_mm_s=.1,
+                    mesh_samples=5, mesh_repeatability_mm=.02, lift_speed_mm_s=10.,
+                    mesh_columns=3, mesh_rows=3, mesh_yaw_deg=0.)
     probing = dict(revision='a'*64, settings=settings)
     bed = dict(revision='d'*64, bed_size_mm=[235.,235.], probe_margin_mm=30., bed_mesh={})
     bed_saved, copies, jobs = [], [], ['preloaded.gcode']
@@ -118,11 +118,18 @@ def main():
         page = context.new_page()
         page.on('pageerror', lambda error: errors.append(str(error)))
         page.goto('http://probing.test/')
-        expect(page.locator('#probing-search-speed')).to_have_value('10')
+        expect(page.locator('#probing-search-speed')).to_have_value('5')
+        expect(page.locator('#probing-search-limit')).to_have_value('350')
+        expect(page.locator('#probing-search-guidance')).to_contain_text('current nozzle-to-bed gap and add 50 mm')
+        expect(page.locator('#probing-search-guidance')).to_contain_text('entire possible search path is checked before motion')
+        expect(page.locator('#probing-search-guidance')).to_contain_text('reduce this range before starting again')
         expect(page.locator('#probing-fine-speed')).to_have_value('0.2')
-        expect(page.locator('#probing-lift-speed')).to_have_value('20')
+        expect(page.locator('#probing-lift-speed')).to_have_value('10')
+        expect(page.locator('#probing-saved')).to_contain_text('initial 5 mm/s')
+        expect(page.locator('#probing-saved')).to_contain_text('upward 10 mm/s')
         expect(page.locator('#probing-mesh-columns')).to_have_value('3')
         expect(page.locator('#probing-mesh-rows')).to_have_value('3')
+        expect(page.locator('#probing-mesh-yaw')).to_have_value('0')
         expect(page.locator('#probing-mesh-speed')).to_have_value('0.1')
         expect(page.locator('#probing-mesh-samples')).to_have_value('5')
         expect(page.locator('#probing-repeatability')).to_have_value('0.02')
@@ -163,18 +170,25 @@ def main():
         cases.append('offline bed resize previews coverage, validates margin, blocks active operations and preserves revision conflicts')
 
         page.fill('#probing-search-speed', '8')
+        page.fill('#probing-search-limit', '250')
         expect(page.locator('#probing-save')).to_be_enabled()
         page.evaluate('refreshProbing()')
         expect(page.locator('#probing-search-speed')).to_have_value('8')
+        expect(page.locator('#probing-search-limit')).to_have_value('250')
         expect(page.locator('#bed-probe-simulate')).to_be_disabled()
         for field, bad, restored in (('probing-search-speed', '11', '8'),
+                                     ('probing-search-limit', '4', '250'),
+                                     ('probing-search-limit', '351', '250'),
+                                     ('probing-search-limit', '', '250'),
                                      ('probing-fine-speed', '', '0.2'),
-                                     ('probing-mesh-speed', '.3', '.1'),
+                                     ('probing-mesh-speed', '.5001', '.1'),
                                      ('probing-mesh-samples', '3.5', '5'),
-                                     ('probing-lift-speed', '21', '20'),
+                                     ('probing-mesh-samples', '0', '5'),
+                                     ('probing-lift-speed', '21', '10'),
                                      ('probing-mesh-columns', '1', '3'),
                                      ('probing-mesh-columns', '2.5', '3'),
                                      ('probing-mesh-rows', '10', '3'),
+                                     ('probing-mesh-yaw', '181', '0'),
                                      ('probing-repeatability', '.001', '.02')):
             page.fill('#'+field, bad)
             expect(page.locator('#probing-save')).to_be_disabled()
@@ -184,15 +198,24 @@ def main():
         expect(page.locator('#probing-save')).to_be_disabled()
         page.fill('#probing-search-speed', '8')
         page.fill('#probing-fine-speed', '.2')
-        page.fill('#probing-lift-speed', '10')
+        page.fill('#probing-lift-speed', '15')
         page.fill('#probing-mesh-columns', '2')
         page.fill('#probing-mesh-rows', '9')
+        page.fill('#probing-mesh-samples', '1')
+        page.fill('#probing-mesh-yaw', '-90')
+        expect(page.locator('#probing-save')).to_be_enabled()
         page.evaluate('document.getElementById("probing-save").click();document.getElementById("probing-save").click()')
         expect(page.locator('#probing-settings-badge')).to_have_text('Saved')
         assert len(saved) == 1 and saved[0]['settings']['first_speed_mm_s'] == 8
-        assert saved[0]['settings']['lift_speed_mm_s'] == 10
+        assert saved[0]['settings']['max_descent_mm'] == 250
+        assert not actions
+        assert saved[0]['settings']['lift_speed_mm_s'] == 15
+        assert saved[0]['settings']['mesh_samples'] == 1
+        assert saved[0]['settings']['mesh_yaw_deg'] == -90
+        expect(page.locator('#probing-saved')).to_contain_text('bed direction -90°')
         assert saved[0]['settings']['mesh_columns'] == 2 and saved[0]['settings']['mesh_rows'] == 9
         expect(page.locator('#probing-saved')).to_contain_text('2×9 mesh (18 points)')
+        expect(page.locator('#probing-saved')).to_contain_text('maximum Z search 250 mm')
         page.evaluate('refreshBedProbe()')
         expect(page.locator('#bed-probe-progress-label')).to_contain_text('0/18 mesh points')
         probe.update(state='meshing', total_points=81, current_point=40)
@@ -201,6 +224,30 @@ def main():
         probe.update(state='idle', total_points=0, current_point=0)
         cases.append('input bounds and slower fine speed enforced; edits survive polling; save uses one revisioned request')
 
+        probe.update(state='waiting_surface', busy=True, max_descent_mm=200.,
+                     confirmation={'stage':'surface','token':'surface-confirmation-token'})
+        page.evaluate('refreshBedProbe()')
+        expect(page.locator('#bed-probe-confirm-detail')).to_contain_text('Maximum downward search from the adjusted position: 200 mm')
+        expect(page.locator('#probing-search-limit')).to_be_disabled()
+        assert len(saved) == 1 and not actions
+        probe.update(trigger_source='klipper_probe',trigger_force_g=200.,trigger_mode='raw',
+                     trigger_value=20000.,trigger_unit='counts',max_value=60000.)
+        page.evaluate('refreshBedProbe()')
+        expect(page.locator('#bed-probe-sensor')).to_contain_text('200 g contact threshold')
+        expect(page.locator('#bed-probe-sensor')).to_contain_text('raw overload stop 60,000 counts')
+        expect(page.locator('#bed-probe-sensor')).not_to_contain_text('20,000 counts contact threshold')
+        expect(page.locator('#bed-probe-sensor')).not_to_contain_text('no conversion to grams')
+        probe['trigger_force_g'] = None
+        page.evaluate('refreshBedProbe()')
+        expect(page.locator('#bed-probe-sensor')).to_contain_text('contact threshold unavailable')
+        probe.update(trigger_source='stream',trigger_force_g=None)
+        page.evaluate('refreshBedProbe()')
+        expect(page.locator('#bed-probe-sensor')).to_contain_text('20,000 counts contact threshold')
+        cases.append('native contact force and independent raw overload guard stay distinct; missing native threshold is explicit')
+        probe.update(state='idle',busy=False,confirmation=None)
+        page.evaluate('refreshBedProbe()')
+        cases.append('surface confirmation shows actual run search limit without starting motion or overwriting saved settings')
+
         page.fill('#probing-fine-speed', '0.15')
         for active, refresh in ((sync, 'refreshSync()'), (load, 'refreshSetup()'),
                                 (probe, 'refreshBedProbe()'), (robot, 'refreshSetup()')):
@@ -208,6 +255,7 @@ def main():
             page.evaluate(refresh)
             expect(page.locator('#probing-save')).to_be_disabled()
             expect(page.locator('#probing-search-speed')).to_be_disabled()
+            expect(page.locator('#probing-search-limit')).to_be_disabled()
             active['busy'] = False
             page.evaluate(refresh)
             expect(page.locator('#probing-save')).to_be_enabled()
@@ -261,14 +309,17 @@ def main():
         page.evaluate('refreshSetup()')
         page.select_option('#load-step-size', '1')
         expect(page.locator('#load-step-down')).to_be_disabled()
-        expect(page.locator('#load-step-guidance')).to_contain_text('0.05 mm or finer')
+        expect(page.locator('#load-step-guidance')).to_contain_text('0.1 mm or finer')
         load['position_mm'][2] = 100.6
         page.evaluate('refreshSetup()')
         page.select_option('#load-step-size', '0.1')
         expect(page.locator('#load-step-down')).to_be_enabled()
         page.click('#load-step-down')
         expect(page.locator('#load-calibration-position')).to_contain_text('100.500')
-        expect(page.locator('#load-step-down')).to_be_disabled()
+        expect(page.locator('#load-step-down')).to_be_enabled()
+        expect(page.locator('[data-calibration-step="-0.1"]')).to_be_enabled()
+        page.click('[data-calibration-step="-0.1"]')
+        expect(page.locator('#load-calibration-position')).to_contain_text('100.400')
         page.select_option('#load-step-size', '0.05')
         expect(page.locator('#load-step-down')).to_be_enabled()
         load['position_mm'][2] = 125.
@@ -295,6 +346,113 @@ def main():
         expect(page.locator('#copy-job-message')).to_contain_text('run both preflights')
         page.click('#setup-tab')
         cases.append('preloaded file copy is single-request, selects its new version and still requires preflight')
+
+        # Five is the saved default, not the lower input bound. Exercise actual
+        # browser editing, polling and revisioned saves below that default.
+        page.fill('#probing-search-speed', '5')
+        page.locator('#probing-search-speed').press('ArrowDown')
+        expect(page.locator('#probing-search-speed')).to_have_value('4')
+        for speed in ('1', '0.5'):
+            page.fill('#probing-search-speed', speed)
+            expect(page.locator('#probing-save')).to_be_enabled()
+            page.evaluate('refreshProbing()')
+            expect(page.locator('#probing-search-speed')).to_have_value(speed)
+            previous_saves = len(saved)
+            page.click('#probing-save')
+            expect(page.locator('#probing-settings-badge')).to_have_text('Saved')
+            assert len(saved) == previous_saves + 1
+            assert saved[-1]['settings']['first_speed_mm_s'] == float(speed)
+            page.click('#probing-reload')
+            expect(page.locator('#probing-search-speed')).to_have_value(speed)
+            expect(page.locator('#probing-saved')).to_contain_text(f'initial {speed} mm/s')
+        page.fill('#probing-search-speed', '0.49')
+        expect(page.locator('#probing-save')).to_be_disabled()
+        expect(page.locator('#probing-speed-guidance')).to_contain_text('Enter an initial search speed from 0.5–10 mm/s')
+        page.fill('#probing-search-speed', '0.5')
+        page.fill('#probing-fine-speed', '0.5')
+        expect(page.locator('#probing-save')).to_be_disabled()
+        expect(page.locator('#probing-speed-guidance')).to_contain_text('Lower the fine speed before saving')
+        page.fill('#probing-fine-speed', '0.15')
+        expect(page.locator('#probing-speed-guidance')).to_contain_text('5 mm/s is the default, not the minimum')
+        cases.append('initial search speeds below five save and reload at one and half a millimetre per second; lower bound stays enforced')
+
+        # Hold a user-requested reload until a new edit has been entered. A late
+        # saved value must not overwrite that edit, even with replaceInputs=true.
+        hold_reload = '''() => {
+          const originalFetch = window.fetch;
+          window.fetch = (...args) => {
+            if (String(args[0]) === '/api/setup/probing') {
+              window.fetch = originalFetch;
+              return new Promise((resolve, reject) => {
+                window.releaseProbeReload = () => originalFetch(...args).then(resolve, reject);
+              });
+            }
+            return originalFetch(...args);
+          };
+          void refreshProbing(true);
+        }'''
+        page.evaluate(hold_reload)
+        page.wait_for_function('typeof window.releaseProbeReload === "function"')
+        page.fill('#probing-search-speed', '1')
+        page.evaluate('window.releaseProbeReload()')
+        expect(page.locator('#probing-message')).to_contain_text('your newer edits were kept')
+        expect(page.locator('#probing-search-speed')).to_have_value('1')
+        expect(page.locator('#probing-save')).to_be_enabled()
+        page.fill('#probing-search-speed', '0.5')
+        cases.append('late manual reload preserves edits entered while its response was pending')
+
+        page.evaluate(hold_reload)
+        page.wait_for_function('typeof window.releaseProbeReload === "function"')
+        # Even an edit back to the cached value must not be replaced by a
+        # concurrent external change. Keep the conflict visible until reload.
+        page.fill('#probing-search-speed', '1')
+        page.fill('#probing-search-speed', '0.5')
+        probing.update(revision='8'*64, settings=dict(probing['settings'], first_speed_mm_s=2.))
+        page.evaluate('window.releaseProbeReload()')
+        expect(page.locator('#probing-search-speed')).to_have_value('0.5')
+        expect(page.locator('#probing-settings-badge')).to_have_text('Reload required')
+        expect(page.locator('#probing-message')).to_contain_text('changed while you were editing')
+        expect(page.locator('#probing-save')).to_be_disabled()
+        page.click('#probing-reload')
+        expect(page.locator('#probing-search-speed')).to_have_value('2')
+        cases.append('late reload preserves equal-to-cached edits and reports concurrent configuration conflicts')
+
+        probing.update(revision='7'*64, settings=dict(probing['settings'],
+            first_speed_mm_s=5., second_speed_mm_s=.5, mesh_speed_mm_s=.5,
+            max_descent_mm=50., mesh_repeatability_mm=.02))
+        page.click('#probing-reload')
+        expect(page.locator('#probing-mesh-speed')).to_have_value('0.5')
+        page.fill('#probing-search-limit', '350')
+        page.fill('#probing-repeatability', '0.03')
+        expect(page.locator('#probing-save')).to_be_enabled()
+        page.click('#probing-save')
+        expect(page.locator('#probing-settings-badge')).to_have_text('Saved')
+        assert saved[-1]['settings']['mesh_speed_mm_s'] == .5
+        assert saved[-1]['settings']['max_descent_mm'] == 350.
+        assert saved[-1]['settings']['mesh_repeatability_mm'] == .03
+        page.reload()
+        expect(page.locator('#probing-search-limit')).to_have_value('350')
+        expect(page.locator('#probing-repeatability')).to_have_value('0.03')
+        expect(page.locator('#probing-mesh-speed')).to_have_value('0.5')
+        cases.append('maximum search and spread save and survive reload with existing half-mm mesh speed')
+
+        def invalid_settings_response(handler):
+            if handler.request.method != 'POST':
+                handler.fallback()
+                return
+            handler.fulfill(status=422, content_type='application/json', body=json.dumps(dict(detail=[{
+                'loc':['body','settings','mesh_speed_mm_s'],
+                'msg':'Input should be less than or equal to 0.5'}])))
+        page.route('**/api/setup/probing', invalid_settings_response)
+        page.fill('#probing-repeatability', '0.025')
+        page.click('#probing-save')
+        expect(page.locator('#probing-message')).to_contain_text('settings.mesh_speed_mm_s: Input should be less than or equal to 0.5')
+        expect(page.locator('#probing-message')).not_to_contain_text('[object Object]')
+        expect(page.locator('#probing-settings-badge')).to_have_text('Reload required')
+        page.unroute('**/api/setup/probing', invalid_settings_response)
+        page.click('#probing-reload')
+        expect(page.locator('#probing-repeatability')).to_have_value('0.03')
+        cases.append('validation failures identify the rejected field and preserve the reload-before-retry guard')
 
         page.set_viewport_size(dict(width=390, height=844))
         page.locator('#probing-form').scroll_into_view_if_needed()

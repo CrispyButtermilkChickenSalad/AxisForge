@@ -26,6 +26,8 @@ class OrientationHarness(BridgeBedProbe):
 
     def robot_reason(self): return ''
 
+    def pump(self): pass
+
     def nozzle_now(self): return self.planner.nozzle_position(self.joints), self.joints.copy()
 
     def run_motion(self, motion):
@@ -35,6 +37,27 @@ class OrientationHarness(BridgeBedProbe):
 
 
 class ProbeOrientationTests(unittest.TestCase):
+    def test_start_outside_orientation_limit_is_actionable_and_never_moves(self):
+        node=OrientationHarness()
+        tilted=SE3.RPY((180.03,-.25,90.03),unit='deg',order='zyx').R
+        node.joints=node.planner.solve(node.initial_tip,node.joints,tilted)
+        with self.assertRaisesRegex(ValueError,'Orientation error.*0.200 deg limit.*Nozzle RPY.*Z descent itself does not rotate'):
+            node.capture_start()
+        self.assertEqual(node.motions,[])
+        self.assertEqual(node.config.orientation_tolerance_deg,.2)
+
+    def test_planning_sensor_failure_prevents_xy_motion(self):
+        node = OrientationHarness()
+        node.capture_start()
+        before = node.target.copy()
+        def failed_sensor():
+            raise RuntimeError('Sensor lost while planning')
+        node.pump = failed_sensor
+        with self.assertRaisesRegex(RuntimeError, 'Sensor lost while planning'):
+            node.line_to(before+[-80.,-80.,0.], 'front-left travel', 120.)
+        self.assertEqual(node.motions, [])
+        np.testing.assert_array_equal(node.target, before)
+
     def test_fast_retract_and_longest_grid_travels_pass_real_ik_and_path_limits(self):
         node = OrientationHarness()
         path = Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'

@@ -179,6 +179,98 @@ class DashboardApiTests(unittest.TestCase):
             self.assertEqual(self.client.post('/api/load-calibration/action',json=body).status_code,422)
         routine._active=False
 
+    def test_z_action_routes_validate_distances_and_distinguish_finish_recovery(self):
+        calibration = self.client.app.state.load_calibration
+        for route, runner in (('/api/bed-probe/action', self.bed_probe),
+                              ('/api/load-calibration/action', calibration)):
+            with self.subTest(route=route), patch.object(runner, 'action', create=True,
+                    new_callable=AsyncMock, return_value={'state':'z_stepping'}) as action:
+                for command, extra in (('step', {'delta_mm':-.05}), ('continue', {}), ('finish_recovery', {})):
+                    body = dict(command=command, token='a'*24, **extra)
+                    self.assertEqual(self.client.post(route, json=body).status_code, 200)
+                for body in (dict(command='step', token='a'*24, delta_mm=2.),
+                             dict(command='step', token='a'*24, delta_mm=True),
+                             dict(command='step', token='a'*24, delta_mm='0.1'),
+                             dict(command='continue', token='a'*24, delta_mm=.1),
+                             dict(command='finish_recovery', token='a'*24, grams=100.),
+                             dict(command='power_on', token='a'*24),
+                             dict(command='step', token='short', delta_mm=.1)):
+                    self.assertEqual(self.client.post(route, json=body).status_code, 422)
+                self.assertEqual(action.await_count, 3)
+        self.assertEqual(self.client.post('/api/bed-probe/action',
+            json=dict(command='finish', token='a'*24)).status_code, 422)
+
+    def test_z_actions_cannot_cross_owners_or_run_during_jobs(self):
+        calibration = self.client.app.state.load_calibration
+        body = dict(command='step', token='a'*24, delta_mm=.1)
+        with patch.object(self.bed_probe, 'action', create=True, new_callable=AsyncMock) as bed_action, \
+                patch.object(calibration, 'action', new_callable=AsyncMock) as scale_action:
+            calibration._active = True
+            self.assertEqual(self.client.post('/api/bed-probe/action', json=body).status_code, 409)
+            calibration._active = False
+            self.bed_probe.active = True
+            self.assertEqual(self.client.post('/api/load-calibration/action', json=body).status_code, 409)
+            self.bed_probe.active = False
+            with patch('bridge_dashboard.app.Workflow.busy', return_value=True):
+                for route in ('/api/bed-probe/action', '/api/load-calibration/action'):
+                    self.assertEqual(self.client.post(route, json=body).status_code, 409)
+            bed_action.assert_not_awaited()
+            scale_action.assert_not_awaited()
+
+    def test_calibration_positioning_and_recovery_hold_job_ownership(self):
+        routine = self.client.app.state.load_calibration
+        routine._active = True
+        try:
+            for state in ('positioning_z', 'recovering_z', 'z_stepping'):
+                routine._snapshot['state'] = state
+                for path, body in (('/api/bed-probe/start', {}), ('/api/robot/connect', {}),
+                                   ('/api/jobs/part.gcode/preflight/both', {}),
+                                   ('/api/sync/start', {'job':'part.gcode'})):
+                    with self.subTest(state=state, path=path):
+                        self.assertEqual(self.client.post(path, json=body).status_code, 409)
+        finally:
+            routine._active = False
+
+    def test_scale_start_options_are_validated_and_backward_compatible(self):
+        routine=self.client.app.state.load_calibration
+        with patch.object(routine,'start',new_callable=AsyncMock,return_value={'state':'starting'}) as start:
+            self.assertEqual(self.client.post('/api/load-calibration/start',json={}).status_code,200)
+            start.assert_awaited_with(dry_run=False,calibration_max_counts=120000.,calibration_hot_target=None)
+            body=dict(dry_run=True,calibration_max_counts=140000,calibration_hot_target=210)
+            self.assertEqual(self.client.post('/api/load-calibration/start',json=body).status_code,200)
+            start.assert_awaited_with(dry_run=True,calibration_max_counts=140000.,calibration_hot_target=210.)
+            for invalid in ({'calibration_max_counts':60000},{'calibration_max_counts':250001},
+                            {'calibration_max_counts':True},{'calibration_max_counts':'120000'},
+                            {'calibration_hot_target':49},{'calibration_hot_target':301},
+                            {'calibration_hot_target':True},{'heat_nozzle':True}):
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(self.client.post('/api/load-calibration/start',json=invalid).status_code,422)
+            self.assertEqual(start.await_count,2)
+
+    def test_scale_record_api_accepts_only_a_measured_weight(self):
+        routine = self.client.app.state.load_calibration
+        with patch.object(routine, 'action', new_callable=AsyncMock, return_value={}) as action:
+            body = dict(command='record', token='a'*24, grams=125.5)
+            self.assertEqual(self.client.post('/api/load-calibration/action', json=body).status_code, 200)
+            action.assert_awaited_once_with('record', 'a'*24, None, 125.5)
+            for invalid in ({**body, 'grams': 49.}, {**body, 'grams': True},
+                            {**body, 'delta_mm': .05}, {**body, 'grams': None},
+                            {'command': 'finish', 'token': 'a'*24, 'grams': 100.}):
+                with self.subTest(invalid=invalid):
+                    self.assertEqual(self.client.post('/api/load-calibration/action', json=invalid).status_code, 422)
+            self.assertEqual(action.await_count, 1)
+
+    def test_clear_native_session_is_an_explicit_idle_only_action(self):
+        routine = self.client.app.state.load_calibration
+        with patch.object(routine, 'clear_session', new_callable=AsyncMock, return_value={'state': 'idle'}) as clear:
+            self.assertEqual(self.client.post('/api/load-calibration/clear-session').status_code, 200)
+            routine._active = True
+            self.assertEqual(self.client.post('/api/load-calibration/clear-session').status_code, 409)
+            routine._active = False
+            with patch('bridge_dashboard.app.Workflow.busy', return_value=True):
+                self.assertEqual(self.client.post('/api/load-calibration/clear-session').status_code, 409)
+            clear.assert_awaited_once()
+
     def test_live_job_is_always_blocked(self):
         response = self.client.post(
             "/api/axisforge/start",
@@ -260,6 +352,19 @@ class DashboardApiTests(unittest.TestCase):
                 self.assertEqual(self.client.post('/api/bed-probe/start',json=value).status_code,422)
         for value in ({'stage':'surface','token':'short'}, {'stage':'home','token':'a'*24}):
             self.assertEqual(self.client.post('/api/bed-probe/confirm',json=value).status_code,422)
+
+    def test_probe_accepts_explicit_temperature_options_and_rejects_invalid_targets(self):
+        thermal={'nozzle_target_c':210.,'bed_target_c':60.,'soak_s':5.}
+        with patch.object(self.bed_probe,'start',new_callable=AsyncMock,return_value={'state':'starting'}) as start:
+            response=self.client.post('/api/bed-probe/start',json={'thermal':thermal})
+            self.assertEqual(response.status_code,200,response.text)
+            start.assert_awaited_once_with(dry_run=False,thermal=thermal)
+            start.reset_mock()
+            for change in ({'nozzle_target_c':True},{'bed_target_c':20.},{'bed_target_c':151.},
+                           {'soak_s':0.},{'soak_s':4.99},{'nozzle_target_c':301.},{'command':'M104 S210'}):
+                response=self.client.post('/api/bed-probe/start',json={'thermal':{**thermal,**change}})
+                self.assertEqual(response.status_code,422,response.text)
+            start.assert_not_awaited()
 
     def test_synchronized_start_requires_preflight_and_legacy_arm_is_rejected(self):
         for action in ("arm", "start"):

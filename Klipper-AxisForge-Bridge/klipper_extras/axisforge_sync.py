@@ -10,12 +10,50 @@ import math
 from pathlib import Path
 import secrets
 import threading
+import time
+from collections import deque
 
 from .axisforge_schedule import PROTOCOL, compile_job, digest
 from .axisforge_corners import options as corner_options, POLICIES
 
 HEARTBEAT_PROTOCOL = 2
 COLD_PREFLIGHT_LEASE_S = 3.
+
+
+class HostClockRate:
+    """Relate Klipper's RAW reactor clock to Python/ROS monotonic seconds.
+
+    Linux frequency discipline affects MONOTONIC but not MONOTONIC_RAW. Use
+    paired local reads (no network) so that discipline is not counted as MCU
+    drift. Retain a rolling baseline and reject reads interrupted by scheduling.
+    """
+    def __init__(self, raw_clock, monotonic=time.monotonic):
+        self.raw_clock, self.monotonic = raw_clock, monotonic
+        self.points = deque()
+        self.rate = self.updated = None
+        self.sample()
+
+    def sample(self):
+        candidates=[]
+        for _ in range(5):
+            before=self.monotonic();raw=self.raw_clock();after=self.monotonic()
+            candidates.append((after-before,(before+after)/2,raw))
+        span,mono,raw=min(candidates)
+        if not all(math.isfinite(v) for v in (span,mono,raw)) or not 0 <= span <= .00001:
+            return self.rate if self.updated is not None and mono-self.updated < 2. else None
+        while len(self.points)>1 and mono-self.points[1][0]>=30.:
+            self.points.popleft()
+        if self.points:
+            start_mono,start_raw=self.points[0]
+            if mono-start_mono>=1.:
+                rate=(raw-start_raw)/(mono-start_mono)
+                if not .999 <= rate <= 1.001:
+                    self.rate=None
+                    return None
+                self.rate,self.updated=rate,mono
+        if not self.points or mono-self.points[-1][0]>=.2:
+            self.points.append((mono,raw))
+        return self.rate
 
 
 class ScheduledExtrusion:
@@ -85,6 +123,8 @@ class AxisForgeSync:
         self.reactor.register_timer(self._watchdog, self.reactor.NOW)
 
     def _ready(self):
+        self.clock_epoch = secrets.token_hex(16)
+        self.host_clock_rate = HostClockRate(self.reactor.monotonic)
         self.toolhead = self.printer.lookup_object('toolhead')
         self.extruder = self.printer.lookup_object('extruder', None)
         self.mcu = self.printer.lookup_object('mcu')
@@ -144,6 +184,11 @@ class AxisForgeSync:
                                    for key in ('pressure_advance','smooth_time')},
                        'extrusion_limits':[self.extruder.max_e_velocity,self.extruder.max_e_accel,
                                            self.extruder.max_e_dist,self.extruder.max_extrude_ratio]})
+
+    def _require_probe_idle(self, request):
+        probe = self.printer.lookup_object('axisforge_probe', None)
+        if probe is not None and probe.is_busy():
+            raise request.error('Native ALPS probing owns Klipper; finish or cancel probing first')
 
     def _require(self, request, lease=True):
         if not self._compatible():
@@ -216,7 +261,14 @@ class AxisForgeSync:
 
     def _clock(self):
         now = self.reactor.monotonic()
-        return {'eventtime':now, 'print_time':self.mcu.estimated_print_time(now)}
+        print_time = self.mcu.estimated_print_time(now)
+        # Print seconds follow the main MCU oscillator, not host wall seconds.
+        # Evaluating the existing linear clock estimator does not schedule work.
+        raw_rate = self.mcu.estimated_print_time(now+1.)-print_time
+        host_rate = self.host_clock_rate.sample()
+        return {'eventtime':now, 'print_time':print_time, 'clock_epoch':self.clock_epoch,
+                'print_time_rate':raw_rate*host_rate if host_rate is not None else None,
+                'mcu_raw_clock_rate':raw_rate, 'reactor_to_monotonic_rate':host_rate}
 
     def _status(self):
         now = self.reactor.monotonic()
@@ -241,6 +293,7 @@ class AxisForgeSync:
 
     def api_capabilities(self, request):
         request.send({'protocol':PROTOCOL, 'control_ready':self._compatible(),
+                      'clock_rate_supported':True,
                       'heartbeat_protocol':HEARTBEAT_PROTOCOL,
                       'cold_preflight_watchdog_seconds':COLD_PREFLIGHT_LEASE_S,
                       'heater_check_options':True,
@@ -254,9 +307,13 @@ class AxisForgeSync:
 
     def api_clock(self, request):
         if not self.mcu: raise request.error('Klipper is not ready')
-        request.send(self._clock())
+        clock=self._clock()
+        if clock['print_time_rate'] is None:
+            raise request.error('Print clock-rate estimator is warming up or its host clock is unstable')
+        request.send(clock)
 
     def api_prepare(self, request):
+        self._require_probe_idle(request)
         if not self._compatible():
             raise request.error('axisforge_sync unavailable: enable module, kinematics:none and supported Klipper')
         if self.preparing: raise request.error('A motion plan is already being prepared')
@@ -328,6 +385,7 @@ class AxisForgeSync:
                       'machine_config':self.prepared_fingerprint})
 
     def api_acquire(self, request):
+        self._require_probe_idle(request)
         if self.preparing: raise request.error('A motion plan is still being prepared')
         self._require(request, lease=False)
         if self.leased: raise request.error('Session is already acquired')

@@ -172,7 +172,8 @@ class BedProbe(MotionExecutor):
         end = np.asarray(end, dtype=float)
         if np.linalg.norm(end - self.target) < 1e-9:
             return
-        motion = self.planner.sampled_line(name, self.target, end, self.seed, speed)
+        motion = self.planner.sampled_line(name, self.target, end, self.seed, speed,
+                                           pump=getattr(self, 'pump', None))
         self.run_motion(motion)
         self.target = end
 
@@ -235,6 +236,7 @@ class BedProbe(MotionExecutor):
             'config': str(Path(self.args.config).resolve()),
             'paper_thickness_mm': self.args.paper_mm,
             'simulated': self.config.dry_run,
+            'kinematic_model': dict(self.planner.kinematic_model),
             'nozzle_rpy_deg': rounded(self.planner.config.nozzle_rpy_deg, 3),
             'tcp_offset_mm': rounded(self.planner.config.tcp_offset_mm, 3),
             'transform': {

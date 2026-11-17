@@ -24,7 +24,7 @@ class ProbeHarness(LoadCellBedProbe):
     def __init__(self, output):
         self.settings = GCodeConfig(z_offset=100., bed_probe_file='')
         self.config = MotionConfig(dry_run=True, clearance_mm=.12, tcp_offset_mm=(-100., 0., 117.06))
-        self.planner = SimpleNamespace(config=self.config)
+        self.planner = SimpleNamespace(config=self.config, kinematic_model={'kind':'nominal_ur16e'})
         self.args = SimpleNamespace(config='unused', floor_mm=.2, paper_mm=0., load_cell='load_cell_probe')
         self.output = Path(output)
         self.points = grid_points(self.settings.bed_size_mm, 30.)
@@ -104,6 +104,19 @@ class BedContactTests(unittest.TestCase):
         for record in data['points']:
             self.assertAlmostEqual(surface.height(record['nozzle_base_mm'][:2]), record['bed_z_mm'])
 
+    def test_single_contact_mesh_still_retracts_and_saves_usable_height(self):
+        self.probe.contact_options = replace(self.probe.contact_options, samples=1)
+        self.probe.probe_current()
+        record = self.probe.records[0]
+        self.assertEqual(len(record['contacts']), 1)
+        self.assertIsNone(record['repeatability_mm'])
+        self.assertFalse(record['repeatability_checked'])
+        self.assertEqual(sum(name == 'contact retract' for _, _, name in self.probe.moves), 1)
+        self.assertGreaterEqual(self.probe.target[2], 100.12)
+        self.assertEqual(record['bed_z_mm'], record['nozzle_base_mm'][2])
+        data = yaml.safe_load(self.output.with_suffix('.pending.yaml').read_text())
+        self.assertIsNone(data['points'][0]['repeatability_mm'])
+
     def test_no_contact_stops_at_floor_without_changing_active_map(self):
         original = self.probe.source.snapshot
         self.probe.source.snapshot = lambda: [replace(s, counts=0.) for s in original()]
@@ -136,8 +149,13 @@ class BedContactTests(unittest.TestCase):
         self.assertFalse(self.probe.records)
 
     def test_failed_repeatability_does_not_replace_previous_map(self):
-        with patch('print_control.load_cell_bed_probe.repeat_contact', side_effect=ValueError('repeatability failed')):
+        with patch('print_control.load_cell_bed_probe.repeat_contact', side_effect=ValueError('repeatability failed')), \
+                patch.object(self.probe,'stop') as stopped, \
+                patch.object(self.probe,'record_contact_failure',create=True) as diagnostic:
             with self.assertRaisesRegex(RuntimeError, 'repeatability'): self.probe.probe_current()
+        stopped.assert_called_once_with()
+        diagnostic.assert_called_once()
+        self.assertEqual(len(self.probe._point_readings),self.probe.contact_options.samples)
         self.assertEqual(self.output.read_text(), 'previous map\n')
         self.assertFalse(self.probe.records)
 

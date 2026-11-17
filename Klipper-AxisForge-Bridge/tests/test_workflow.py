@@ -26,6 +26,7 @@ class RobotClient:
         self.events,self.heater=events,heater
         self.state='idle'; self.next=0; self.plan=None; self.session=None
         self.fail_plan=False; self.fail_run=False; self.clock_options=None
+        self.finish_required=False; self.finish_completed=False; self.fail_return=False
     async def call(self,action,**data):
         self.events.append(('robot',action,data))
         if action=='prepare':
@@ -42,7 +43,13 @@ class RobotClient:
                 self.state='fault' if self.fail_run else 'at_boundary'; self.next+=1
             self.motion=asyncio.create_task(finish())
             return {'accepted':True}
-        elif action=='complete': self.state='complete'
+        elif action=='finish_print':
+            assert self.heater.target == 0, 'Heaters must be off before return'
+            self.state='fault' if self.fail_return else 'at_boundary'
+            self.finish_completed=not self.fail_return
+        elif action=='complete':
+            assert not self.finish_required or self.finish_completed
+            self.state='complete'
         elif action=='abort':
             if self.session and data['session'] != self.session:
                 raise ParticipantError('Robot sync abort failed: Unknown robot session')
@@ -51,6 +58,9 @@ class RobotClient:
         return {'protocol':'axisforge.sync.v1','enabled':True,'control_ready':True,
                 'corner_policies':['exact','klipper','marlin','blend'],
                 'clock_options_supported':True,'clock_options':self.clock_options,
+                'clock_rate_supported':True,
+                'finish_required':self.finish_required,'finish_completed':self.finish_completed,
+                'finish_move':{'kind':'lift','distance_mm':10.},
                 'state':self.state,'session':self.session,'error':'injected robot failure',
                 'progress':1.,'next_chunk':self.next,'config_hash':'robot-config',
                 'plan_hash':self.plan['plan_hash'] if self.plan else None,
@@ -78,6 +88,26 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def preflight(self, heater_checks=None):
         await self.flow.preflight('part.gcode', heater_checks)
         await asyncio.wait_for(self.flow.task,3.)
+
+    async def test_successful_print_returns_home_before_releasing_ownership(self):
+        self.robot.finish_required=True
+        await self.preflight()
+        self.assertTrue(any(c['name']=='Move after printing' for c in self.flow.checks))
+        await self.flow.start('part.gcode');await asyncio.wait_for(self.flow.task,3.)
+        self.assertEqual(self.flow.state,'complete',self.flow.message)
+        self.assertIn('lifted 10 mm above the final print point',self.flow.message)
+        actions=[(p,a) for p,a,d in self.events]
+        home=actions.index(('robot','finish_print'))
+        self.assertLess(home,actions.index(('robot','complete')))
+        self.assertLess(home,actions.index(('master','complete')))
+        self.assertIn(('master','heaters_off'),actions[:home])
+
+    async def test_return_failure_is_not_reported_as_success(self):
+        self.robot.finish_required=True;self.robot.fail_return=True
+        await self.preflight();await self.flow.start('part.gcode')
+        await asyncio.wait_for(self.flow.task,3.)
+        self.assertEqual(self.flow.state,'failed')
+        self.assertFalse(any(action=='complete' for who,action,data in self.events))
 
     async def test_bed_probe_ownership_blocks_preflight_before_heating_or_robot_commands(self):
         original = self.robot.call
@@ -190,6 +220,21 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
         current=ClockMap(1000.,.003,self.flow.clock()-6.)
         with self.assertRaisesRegex(ParticipantError,'stale'):
             await self.flow._check_running_clock(original)
+
+    async def test_known_mcu_rate_does_not_accumulate_false_alignment_error(self):
+        now=self.flow.clock()
+        original=ClockMap(1000.,.003,now-600.,1.0000365)
+        current=ClockMap(original.offset_at(now),.003,now,1.0000365)
+        async def sample(_,**kwargs):return current
+        self.flow.clock_sampler=sample
+        await self.flow._check_running_clock(original)
+        self.assertAlmostEqual(self.flow.clock_measurement['alignment_error_ms'],3.)
+        self.assertAlmostEqual(self.flow.clock_measurement['scheduled_clock_rate_ppm'],36.5)
+        # An unexpected extra phase jump still aborts; no running goal is shifted.
+        current=ClockMap(current.offset+.02,.003,now,1.0000365)
+        with self.assertRaisesRegex(ParticipantError,'alignment error'):
+            await self.flow._check_running_clock(original)
+        self.assertEqual(original.offset,1000.)
 
     async def test_clock_options_bound_to_preflight_start_and_robot_schedule(self):
         chosen={'max_uncertainty_ms':10.,'max_alignment_error_ms':15.}
@@ -576,8 +621,27 @@ class WorkflowTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ClockTests(unittest.IsolatedAsyncioTestCase):
+    async def test_affine_clock_preserves_start_and_end_times_over_a_long_run(self):
+        rate=1.0000365
+        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={
+            'print_time':1000.+rate*10.001,'print_time_rate':rate}))
+        times=iter([10.,10.002])
+        mapping=await sample_clock(master,clock=lambda:next(times),samples=1)
+        for local in (12.,312.,792.):
+            self.assertAlmostEqual(mapping.local_time(1000.+rate*local,now=11.),local,places=8)
+        self.assertAlmostEqual(mapping.rate,rate)
+
+    async def test_invalid_clock_rate_is_rejected(self):
+        for rate in (0.,True,'1',float('nan'),.998,1.002):
+            with self.subTest(rate=rate):
+                master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={
+                    'print_time':110.,'print_time_rate':rate}))
+                with self.assertRaisesRegex(ParticipantError,'Invalid Klipper clock sample'):
+                    await sample_clock(master)
+
     async def test_mapping_and_stale_clock(self):
-        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':110.}))
+        readings=iter([110.,110.101])
+        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':next(readings)}))
         times=iter([10.,10.002,10.1,10.104])
         mapping=await sample_clock(master,clock=lambda:next(times),samples=2)
         self.assertAlmostEqual(mapping.offset,99.999)
@@ -585,15 +649,17 @@ class ClockTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ParticipantError): mapping.local_time(111.,now=16.)
 
     async def test_retries_initial_jitter_without_relaxing_uncertainty(self):
-        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':110.}))
+        readings=iter([110.02,110.12,110.22,110.32,110.42,110.504])
+        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':next(readings)}))
         times=iter([10.,10.040,10.1,10.140,10.2,10.240,10.3,10.340,
                     10.4,10.440,10.5,10.508])
         mapping=await sample_clock(master,clock=lambda:next(times),interval=0)
         self.assertAlmostEqual(mapping.uncertainty,.005)
-        self.assertAlmostEqual(mapping.offset,99.496)
+        self.assertAlmostEqual(mapping.offset,100.)
 
     async def test_persistent_high_latency_is_rejected_with_measurements(self):
-        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':110.}))
+        readings=iter(110.02+i*.05 for i in range(20))
+        master=SimpleNamespace(call=lambda action:asyncio.sleep(0,result={'print_time':next(readings)}))
         times=iter(t for i in range(20) for t in (10.+i*.05,10.04+i*.05))
         with self.assertRaisesRegex(ParticipantError,
                 r'21.00 ms exceeds 10 ms \(best round trip 40.00 ms across 20 samples\)'):

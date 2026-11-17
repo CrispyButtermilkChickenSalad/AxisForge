@@ -1,5 +1,6 @@
 """Strict, single-use confirmations and a bridge heartbeat for guided probing."""
 import json
+import math
 import secrets
 import sys
 import threading
@@ -7,6 +8,7 @@ import time
 
 
 EVENT_PREFIX = 'AXISFORGE_PROBE '
+Z_STEP_SIZES = (.001, .01, .05, .1, .5, 1., 10.)
 
 
 class ProbeControl:
@@ -25,6 +27,10 @@ class ProbeControl:
         self.confirmed = False
         self.reason = None
         self.state = 'idle'
+        self.z_mode = None
+        self.action_token = None
+        self.action_deadline = 0.
+        self.z_action = None
 
     def start(self):
         threading.Thread(target=self._read, daemon=True).start()
@@ -55,6 +61,21 @@ class ProbeControl:
             if kind == 'abort':
                 self.cancel('Operator cancelled bed probing')
                 return True
+            if kind in ('step', 'continue', 'finish_recovery'):
+                self.check()
+                if (self.z_mode is None or self.action_token is None or self.z_action is not None or
+                        self.clock() >= self.action_deadline or command.get('token') != self.action_token):
+                    return False
+                if kind == 'step':
+                    delta = command.get('delta_mm')
+                    if type(delta) not in (int, float) or not math.isfinite(delta) or abs(delta) not in Z_STEP_SIZES:
+                        raise ValueError('Invalid Z step distance')
+                elif ('delta_mm' in command or
+                      kind != ('continue' if self.z_mode == 'positioning' else 'finish_recovery')):
+                    return False
+                self.z_action = dict(command)
+                self.action_token = None
+                return True
             if kind != 'confirm': raise ValueError('Unknown probe control command')
             if (self.reason or self.confirmed or self.pending is None or
                     self.pending_deadline is None or self.clock() >= self.pending_deadline or
@@ -78,9 +99,40 @@ class ProbeControl:
     def emit(self, state, message, **values):
         with self.lock:
             self.state = state
-            data = {'state': state, 'message': message, 'confirmation': None, **values}
+            data = {'state': state, 'message': message, 'confirmation': None,
+                    'z_controls': None, 'action_token': None, **values}
             self.output.write(EVENT_PREFIX+json.dumps(data, allow_nan=False)+'\n')
             self.output.flush()
+
+    def wait_z_action(self, phase, pump, values):
+        if phase not in ('positioning', 'recovery'):
+            raise ValueError('Unknown Z-control phase')
+        deadline = self.clock()+self.confirmation_timeout_s
+        next_report = 0.
+        self.z_mode = phase
+        try:
+            while True:
+                self.check()
+                if self.clock() >= deadline:
+                    raise RuntimeError('Z controls inactive for five minutes; stopped without moving')
+                with self.lock:
+                    if self.z_action is not None:
+                        result, self.z_action = self.z_action, None
+                        return result
+                    if self.action_token is None or self.clock() >= self.action_deadline:
+                        self.action_token = secrets.token_hex(16)
+                        self.action_deadline = self.clock()+10.
+                        next_report = 0.
+                    if self.clock() >= next_report:
+                        self.emit('positioning_z' if phase == 'positioning' else 'recovering_z',
+                            'Use Z steps to position the unloaded nozzle, then continue the search.' if phase == 'positioning'
+                            else 'Contact search stopped. Use Up to release the nozzle, then finish recovery and retry.',
+                            action_token=self.action_token, z_controls=values())
+                        next_report = self.clock()+.5
+                pump()
+        finally:
+            with self.lock:
+                self.z_mode, self.action_token, self.z_action = None, None, None
 
     def wait_confirmation(self, stage, message, pump, **values):
         if stage not in self.confirmation_stages: raise ValueError('Unknown confirmation stage')

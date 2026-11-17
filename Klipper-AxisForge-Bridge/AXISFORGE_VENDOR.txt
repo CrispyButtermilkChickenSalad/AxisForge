@@ -1,15 +1,12 @@
 Source: https://github.com/CrispyButtermilkChickenSalad/Klipper-AxisForge-Bridge
-Source commit: ebd8b02191773862b4cd9e1dcaeeabe7902773e8
-Updated on: 2026-11-12
+Source commit: 57ec339c3a0db0e37db675ccdcbf71cda79a9b73
+Updated on: 2026-11-17
 
-This is a source snapshot without a nested .git directory or virtual environment.
-Local change: the dashboard ALPS iframe delegates local-network permissions
-alongside Web Serial and explains how to grant browser access when connecting.
-Docker integration lives in ../compose.yaml, ../Dockerfile and ../docker/bridge.sh.
-Usage and local AxisForge compatibility limits are documented in ../README.md.
+Source snapshot without nested Git metadata or a virtual environment.
+Docker integration lives in ../compose.yaml and ../docker/.
+The compact README and docs/dashboard-guide.md match the standalone repository.
 
-Previous local snapshot backup: ../.docker/updates/20261112-bridge-ebd8b02-follower-fdc5c97/Klipper-AxisForge-Bridge
-This is not a submodule. Synchronize updates deliberately and rerun the tests.
+Known limitation: clock alignment still exceeds the 10 ms guard in a long
+stationary test. See docs/synchronized-jobs.md for validation details.
 
-Local sync v1 development adds the Klipper master, robot workflow and installer.
-Review changes are exported separately in ../.docker/review/Bridge-sync.patch.
+This is not a submodule. Synchronize updates deliberately and rerun tests.

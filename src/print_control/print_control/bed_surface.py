@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 from scipy.interpolate import RBFInterpolator
 import yaml
+from print_control.bed_frame import BedFrame
+from print_control.ur_kinematics import NOMINAL_MODEL
 
 # Transforming only segment endpoints leaves a chord error on a curved bed: about
 # 0.095 mm for a 95 mm line on the first probed bed, 0.002 mm for 10 mm pieces.
@@ -35,15 +37,19 @@ class BedSurface:
         self.stamp = stamp
         self.source = source
         self.orientation_note = ''
+        self.frame = None
 
     @classmethod
-    def load(cls, path, tcp_offset_mm, nozzle_rpy_deg, extrapolation_mm, *, expected_bed_size=None):
+    def load(cls, path, tcp_offset_mm, nozzle_rpy_deg, extrapolation_mm, *, expected_bed_size=None,
+             expected_model=None):
         """Reuse upright Base-frame measurements with the same calibrated nozzle TCP."""
         path = Path(path).expanduser().resolve()
         if not path.is_file():
             raise ValueError(f'bed_probe_file not found: {path} '
                              '(run bed_probe from the AxisForge root, or set it to "")')
         data = yaml.safe_load(path.read_text())
+        if expected_model is not None and data.get('kinematic_model', NOMINAL_MODEL) != expected_model:
+            raise ValueError('Robot kinematic model changed; run Home & probe bed before printing')
         if data.get('simulated') is True or data.get('complete') is False:
             raise ValueError(f'{path.name}: simulated or incomplete bed maps cannot be used for printing')
         if expected_bed_size is not None:
@@ -87,6 +93,15 @@ class BedSurface:
         z = [point['bed_z_mm'] for point in points]
         surface = cls(xy, z, extrapolation_mm, str(data.get('stamp', '')), str(path))
         surface.orientation_note = orientation_note
+        if 'bed_frame' in data:
+            frame=BedFrame.from_dict(data['bed_frame'])
+            if not np.allclose(frame.size_mm,data['transform']['bed_size_mm'],atol=.001,rtol=0):
+                raise ValueError('Bed frame dimensions disagree with the measured mesh')
+            for point in points:
+                gcode=np.asarray(point.get('gcode_xy'),dtype=float)
+                if gcode.shape!=(2,) or not np.all(np.isfinite(gcode)) or np.linalg.norm(frame.to_base(gcode)-np.asarray(point['nozzle_base_mm'])[:2])>.2:
+                    raise ValueError('Measured points disagree with the calibrated bed frame')
+            surface.frame=frame
         return surface
 
     def height(self, xy):

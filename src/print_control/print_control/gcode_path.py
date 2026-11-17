@@ -50,6 +50,8 @@ class GCodeConfig:
     bed_probe_file: str = ''
     bed_z_adjust_mm: float = 0.0
     bed_probe_extrapolation_mm: float = 5.0
+    return_to_homing_pose: bool = False
+    post_print_lift_mm: float = 0.0
     ignored_commands: tuple = ('G28', 'M84', 'M104', 'M105', 'M106', 'M107', 'M109',
                                'M140', 'M190')
 
@@ -61,6 +63,13 @@ class GCodeConfig:
             raise ValueError('origin_at_center must be boolean')
         if not isinstance(self.lookahead_enabled, bool):
             raise ValueError('lookahead_enabled must be boolean')
+        if not isinstance(self.return_to_homing_pose, bool):
+            raise ValueError('return_to_homing_pose must be boolean')
+        if (type(self.post_print_lift_mm) not in (int, float) or
+                not math.isfinite(self.post_print_lift_mm) or not 0 <= self.post_print_lift_mm <= 50):
+            raise ValueError('post_print_lift_mm must be between 0 and 50 mm (0 disables the lift)')
+        if self.return_to_homing_pose and self.post_print_lift_mm:
+            raise ValueError('Choose either post_print_lift_mm or return_to_homing_pose')
         if self.max_path_acceleration_mm_s2 <= 0:
             raise ValueError('max_path_acceleration_mm_s2 must be positive')
         if self.extrusion_move_margin_s <= 0:
@@ -152,12 +161,15 @@ class GCodePlanner(MotionPlanner):
             self.bed = BedSurface.load(
                 settings.bed_probe_file, self.config.tcp_offset_mm, self.config.nozzle_rpy_deg,
                 settings.bed_probe_extrapolation_mm, expected_bed_size=settings.bed_size_mm,
+                expected_model=self.kinematic_model,
             )
 
     def transform(self, point):
         """G-code to robot Base; with a probed bed, Z rides on the measured surface."""
         base = np.asarray(self.settings.transform(point), dtype=float)
         if self.bed is not None:
+            if self.bed.frame is not None:
+                base[:2]=self.bed.frame.to_base(np.asarray(point)[:2])
             base[2] = point[2] + self.bed.height(base) + self.settings.bed_z_adjust_mm
         return tuple(base)
 
@@ -250,10 +262,12 @@ class GCodePlanner(MotionPlanner):
         duration_parts(float(motion.times[-1]))
         return motion, path
 
-    def retime(self, motion):
+    def retime(self, motion, *, pump=None):
         """Stretch time to satisfy extrema of the commanded joint cubic curves."""
         speed_ratio = acceleration_ratio = 1.0
         for index, dt in enumerate(np.diff(motion.times)):
+            if pump is not None:
+                pump()
             q0, q1 = motion.positions[index:index + 2]
             v0, v1 = motion.velocities[index:index + 2]
             a = 2 * q0 - 2 * q1 + dt * (v0 + v1)
@@ -276,7 +290,7 @@ class GCodePlanner(MotionPlanner):
         return motion
 
     def sampled_line(self, name, start, end, seed, speed, end_orientation_deg=None,
-                     minimum_duration_s=0.0):
+                     minimum_duration_s=0.0, *, pump=None):
         """Sample XYZ and A/B/C together, rotating about the calibrated nozzle tip."""
         start, end = np.asarray(start), np.asarray(end)
         distance = float(np.linalg.norm(end - start))
@@ -301,6 +315,8 @@ class GCodePlanner(MotionPlanner):
         positions = [np.asarray(seed)]
         self.check_pose(seed, start, start)
         for point, u in zip(xyz[1:], progress[1:]):
+            if pump is not None:
+                pump()
             rotation = self.rotation_for(start_orientation + u * orientation_delta)
             joints = self.solve(point, positions[-1], rotation)
             if np.max(np.abs(np.rad2deg(joints - positions[-1]))) > self.config.max_joint_step_deg:
@@ -314,7 +330,7 @@ class GCodePlanner(MotionPlanner):
         positions = np.asarray(positions)
         velocities = np.gradient(positions, times, axis=0)
         velocities[[0, -1]] = 0.0
-        motion = self.retime(PlannedMotion(name, positions, velocities, times))
+        motion = self.retime(PlannedMotion(name, positions, velocities, times), pump=pump)
         if turn_deg:
             def pose_at(index, fraction):
                 u = (index + fraction) / intervals
@@ -322,9 +338,9 @@ class GCodePlanner(MotionPlanner):
                 return (start + progress * (end - start),
                         self.rotation_for(start_orientation + progress * orientation_delta))
 
-            self.check_motion(motion, pose_at=pose_at)
+            self.check_motion(motion, pose_at=pose_at, pump=pump)
         else:
-            self.check_motion(motion, xyz)
+            self.check_motion(motion, xyz, pump=pump)
         self.orientation = tuple(float(value) for value in end_orientation)
         self.rotation = self.rotation_for(self.orientation)
         return motion

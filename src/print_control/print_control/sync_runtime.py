@@ -10,10 +10,12 @@ import time
 
 import numpy as np
 
-from print_control.motion_planner import JOINT_NAMES, cubic_joint_state
+from print_control.motion_planner import JOINT_NAMES, cubic_joint_state, duration_parts
 from print_control.sync_path import PROTOCOL, TimedPath, configuration
-from print_control.sync_clock import clock_options
+from print_control.sync_clock import clock_options, clock_rate, motion_in_host_time
 from print_control.robot_ownership import RobotControlLock
+from print_control.sync_tracking import PrintTracking
+from print_control.probe_alignment import rotation_error_deg
 
 
 class RobotWorker:
@@ -39,6 +41,8 @@ class RobotWorker:
         self.stopping = False
         self.stop_unconfirmed = False
         self.thread = None
+        self.finish_completed = False
+        self.tracking = PrintTracking()
         self.stop = threading.Event()
         self.watchdog = threading.Thread(target=self._watchdog, daemon=True)
         self.watchdog.start()
@@ -52,6 +56,7 @@ class RobotWorker:
             return {'protocol':PROTOCOL, 'enabled':self.enabled,
                     'corner_policies':['exact','klipper','marlin','blend'],
                     'clock_options_supported':True,
+                    'clock_rate_supported':True,
                     'clock_options':dict(self.clock_options),
                     'control_ready':self.enabled and feedback['ready'] and not external_busy,
                     'state':self.state, 'error':self.error, 'session':self.session,
@@ -60,6 +65,11 @@ class RobotWorker:
                     'config_hash':config_hash,
                     'compiled_config_hash':None if not self.compiled else self.compiled.config_hash,
                     'feedback':feedback, 'leased':self.lease,
+                    'finish_required': bool(getattr(self.compiled, 'finish_move', None)),
+                    'finish_move': getattr(self.compiled, 'finish_move', None),
+                    'finish_completed': self.finish_completed,
+                    'z_reference': getattr(self.compiled, 'z_reference', None),
+                    'tracking': self.tracking.status(),
                     'external_control_busy':external_busy,
                     'heartbeat':dict(self.heartbeat_stats)}
 
@@ -108,6 +118,8 @@ class RobotWorker:
             self.session, self.compiled, self.goal = session, None, None
             self.clock_options = timing
             self.state, self.error, self.progress, self.next_chunk = 'preflighting', '', 0., 0
+            self.finish_completed = False
+            self.tracking = PrintTracking()
             self.lease, self.deadline = True, self.clock()+self.lease_s
             self.generation += 1
             generation = self.generation
@@ -117,6 +129,13 @@ class RobotWorker:
                     def report(done, total):
                         with self.lock: self.progress = done/max(1,total)
                     compiled = self.compiler(self.config_path, plan, seed, report, self.cancelled.is_set)
+                    for motion in getattr(compiled, 'finish_preview', ()):
+                        if hasattr(self.backend, 'validate_motion'):
+                            def check_return():
+                                if self.cancelled.is_set(): raise RuntimeError('Post-print preflight cancelled')
+                                feedback = self.backend.feedback()
+                                if not feedback['ready']: raise RuntimeError(feedback['reason'])
+                            self.backend.validate_motion(motion, compiled.planner.nozzle_position, check_return)
                     if hasattr(self.backend, 'prepare_motions'):
                         self.backend.prepare_motions(compiled.chunks, self.cancelled.is_set)
                     with self.lock:
@@ -206,6 +225,10 @@ class RobotWorker:
             if type(uncertainty) not in (float,int) or not 0 <= uncertainty <= limit/1000:
                 raise ValueError('Clock uncertainty exceeds %g ms' % limit)
             motion = self.compiled.chunks[index]
+            rate=clock_rate(data.get('print_time_rate',1.))
+            if rate > getattr(compiled,'max_clock_rate',1.):
+                raise ValueError('Print clock rate exceeds the preflighted motion margin')
+            motion=motion_in_host_time(motion,rate)
             if np.max(abs(joints-motion.positions[0])) > math.radians(1):
                 raise ValueError('Robot moved away from the preflighted chunk start')
             self.state = 'arming'
@@ -224,7 +247,7 @@ class RobotWorker:
         accepted.result(timeout=max(.1, start-self.clock()-.25))
         return {'accepted':True, 'index':index, 'start_monotonic':start}
 
-    def _execute(self, motion, start, generation, chunk_index, accepted=None):
+    def _execute(self, motion, start, generation, chunk_index, accepted=None, phase='approaching'):
         data = {'session':self.session}
         checked_generation, compiled = self._motion_context(data)
         with self.lock:
@@ -240,7 +263,7 @@ class RobotWorker:
             elif self.clock() >= start-.25:
                 rejection = 'Controller accepted the goal after the commit deadline'
             else:
-                self.goal, self.state = goal, 'armed' if chunk_index is not None else 'approaching'
+                self.goal, self.state = goal, 'armed' if chunk_index is not None else phase
                 self.validation_deadline = self.clock()+.25
                 if accepted is not None: accepted.set_result(True)
         if rejection:
@@ -258,6 +281,12 @@ class RobotWorker:
                 if self.clock() >= start and chunk_index is not None: self.state = 'running'
             if self.clock() > end+2.: raise RuntimeError('Robot missed the chunk completion deadline')
             elapsed = self.clock()-start
+            if chunk_index is not None and hasattr(self.backend, 'joint_observation'):
+                observed = self.backend.joint_observation()
+                if observed is not None and observed['time'] != getattr(self, '_tracking_stamp', None):
+                    self._tracking_stamp = observed['time']
+                    self.tracking.observe(motion, observed['time']-start, observed['joints'],
+                                          compiled.planner.nozzle_position)
             if 0 <= elapsed <= motion.times[-1]:
                 index = min(len(motion.times)-2, max(0, np.searchsorted(motion.times, elapsed)-1))
                 dt = motion.times[index+1]-motion.times[index]
@@ -273,8 +302,55 @@ class RobotWorker:
         with self.lock:
             if self.cancelled.is_set() or generation != self.generation: return
             if chunk_index is not None: self.next_chunk += 1
-            self.state, self.goal = 'at_boundary', None
+            self.state, self.goal = ('finishing_print' if phase=='finishing_print' else 'at_boundary'), None
             self.validation_deadline = None
+
+    def finish_print(self, data):
+        generation, compiled = self._motion_context(data)
+        with self.lock:
+            self._require_context(data, generation, compiled)
+            if (self.state != 'at_boundary' or self.next_chunk != len(compiled.chunks)
+                    or self.finish_completed or not getattr(compiled, 'finish_move', None)):
+                raise ValueError('Post-print motion is only allowed once after all print chunks finish')
+            self.state = 'finishing_print'
+
+        def run():
+            try:
+                def check():
+                    checked, current = self._motion_context(data)
+                    with self.lock:
+                        self._require_context(data, generation, compiled)
+                        if checked != generation or current is not compiled:
+                            raise RuntimeError('Post-print session changed')
+                start_joints = self.backend.joints()
+                motions = compiled.finish_print(start_joints, self.cancelled.is_set)
+                if not motions: raise RuntimeError('Post-print move produced no trajectory')
+                target = (compiled.planner.nozzle_position(start_joints) +
+                          np.array([0., 0., compiled.finish_move['distance_mm']])
+                          if compiled.finish_move['kind'] == 'lift' else
+                          np.array(compiled.finish_move['position_mm']))
+                # Validate the fresh finishing path before sending its first move.
+                for motion in motions:
+                    check()
+                    self.backend.validate_motion(motion, compiled.planner.nozzle_position, check)
+                for motion in motions:
+                    check()
+                    self._execute(motion, self.clock()+.6, generation, None, phase='finishing_print')
+                actual_joints = self.backend.joints()
+                actual = compiled.planner.nozzle_position(actual_joints)
+                kinematics = compiled.planner.kinematics
+                if (np.linalg.norm(actual-target) > .1 or
+                        rotation_error_deg(kinematics.eval(actual_joints)[:3, :3],
+                            kinematics.eval(motions[-1].positions[-1])[:3, :3]) > .05):
+                    raise RuntimeError('Robot did not reach the post-print pose')
+                with self.lock:
+                    self._require_context(data, generation, compiled)
+                    self.finish_completed, self.state = True, 'at_boundary'
+            except Exception as error:
+                self.abort(dict(data, reason=str(error)), _generation=generation)
+        self.thread = threading.Thread(target=run, daemon=True)
+        self.thread.start()
+        return self.status()
 
     def _cancel_goal(self, goal):
         try: self.backend.cancel(goal)
@@ -291,6 +367,8 @@ class RobotWorker:
             self._require(data)
             if self.state != 'at_boundary' or self.next_chunk != len(self.compiled.chunks):
                 raise ValueError('Robot has unfinished chunks')
+            if getattr(self.compiled, 'finish_move', None) and not self.finish_completed:
+                raise ValueError('Robot has not completed its post-print move')
             self.state, self.lease = 'complete', False
             if self.control_lock is not None:self.control_lock.release()
         return self.status()
@@ -373,6 +451,7 @@ class ROSRobot:
         self.prepared_motions = {}
         self.lock = threading.RLock()
         self.values, self.joint_time = None, 0.
+        self.joint_source_time = 0.
         self.signals = {}
 
         def joints(msg):
@@ -384,6 +463,7 @@ class ROSRobot:
             with self.lock:
                 self.values = np.array([mapping[n] for n in JOINT_NAMES])
                 self.joint_time = time.monotonic()
+                self.joint_source_time = self.joint_time-(self.node.get_clock().now().nanoseconds/1e9-stamp)
 
         def signal(name, value):
             with self.lock: self.signals[name] = (value,time.monotonic())
@@ -405,6 +485,12 @@ class ROSRobot:
         with self.lock:
             if self.values is None: raise ValueError('No robot joint state')
             return self.values.copy()
+
+    def joint_observation(self):
+        with self.lock:
+            if self.values is None or time.monotonic()-self.joint_source_time > .25:
+                return None
+            return {'time': self.joint_source_time, 'joints': self.values.copy()}
 
     def feedback(self):
         with self.lock:
@@ -466,16 +552,28 @@ class ROSRobot:
 
     def prepare_motions(self, motions, cancelled=lambda:False):
         # Build large messages during cold preflight. Stamps are assigned only
-        # when scheduled; positions, velocities and times remain unchanged.
+        # when scheduled. Geometry stays fixed; time/velocity units are converted
+        # to the sampled print-clock rate immediately before dispatch.
         prepared = {}
         for motion in motions:
             prepared[id(motion)] = (motion, self._build_goal(motion, cancelled))
         self.prepared_motions = prepared
 
+    def validate_motion(self, motion, nozzle_fk, pump):
+        from print_control.ur_safety_limits import RobotSafetyChecker
+        RobotSafetyChecker().validate(motion, pump=pump, nozzle_fk=nozzle_fk)
+
     def send(self, motion, start):
         from builtin_interfaces.msg import Time
-        prepared = getattr(self, 'prepared_motions', {}).get(id(motion))
-        goal = prepared[1] if prepared is not None and prepared[0] is motion else self._build_goal(motion)
+        source=getattr(motion,'master_motion',motion)
+        prepared = getattr(self, 'prepared_motions', {}).get(id(source))
+        goal = prepared[1] if prepared is not None and prepared[0] is source else self._build_goal(motion)
+        if prepared is not None and source is not motion:
+            # Geometry is already allocated during cold preflight. Convert only
+            # time and its derivative; never change queued goals during motion.
+            for point,v,t in zip(goal.trajectory.points,motion.velocities,motion.times):
+                point.velocities=v.tolist()
+                point.time_from_start.sec,point.time_from_start.nanosec=duration_parts(float(t))
         self.active_clock_offset = self.node.get_clock().now().nanoseconds/1e9-time.monotonic()
         stamp = self.node.get_clock().now().nanoseconds + round((start-time.monotonic())*1e9)
         goal.trajectory.header.stamp = Time(sec=stamp//1000000000, nanosec=stamp%1000000000)
@@ -559,7 +657,7 @@ def serve(worker, port):
             self.respond(200,worker.status())
 
         def do_POST(self):
-            actions = ('prepare','acquire','heartbeat','release','approach','schedule','complete','abort')
+            actions = ('prepare','acquire','heartbeat','release','approach','schedule','finish_print','complete','abort')
             if self.path[1:] not in actions: return self.respond(404,{'error':'Unknown endpoint'})
             if self.headers.get('Content-Type','').split(';')[0] != 'application/json':
                 return self.respond(415,{'error':'application/json required'})

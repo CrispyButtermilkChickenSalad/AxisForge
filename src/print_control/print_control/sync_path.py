@@ -12,6 +12,8 @@ import yaml
 from print_control.gcode_path import GCodeConfig, GCodePlanner
 from print_control.bed_surface import BedSurface
 from print_control.motion_planner import MotionConfig, PlannedMotion
+from print_control.print_return import saved_home, return_motions, lift_motion
+from print_control.sync_clock import MAX_CLOCK_RATE
 
 PROTOCOL = 'axisforge.sync.v1'
 
@@ -34,6 +36,8 @@ def configuration(path):
         material.append(Path(settings.bed_probe_file).read_bytes())
     calibration = path.parent/'ur16e_calibration.yaml'
     if calibration.exists(): material.append(calibration.read_bytes())
+    if motion.kinematics_file:
+        material.append(Path(motion.kinematics_file).expanduser().read_bytes())
     signature = hashlib.sha256(b'\0'.join(material)).hexdigest()
     return settings, motion, signature
 
@@ -186,7 +190,10 @@ class TimedPath:
                     (settings.nozzle_roll_deg+a, settings.nozzle_pitch_deg+b,
                      settings.wrist_angle+c), settings.bed_probe_extrapolation_mm)
         self.planner = planner = GCodePlanner(settings, motion)
+        self.home = saved_home(settings)
+        self.print_top_mm = max(planner.bed.z) if planner.bed is not None else settings.z_offset
         self.plan, self.chunks = plan, []
+        self.max_clock_rate = MAX_CLOCK_RATE
         self.entry = np.array(plan['entry'], dtype=float)
         planner.orientation = tuple(self.entry[3:])
         planner.rotation = planner.rotation_for(self.entry[3:])
@@ -228,6 +235,19 @@ class TimedPath:
                                             positions,velocities,times))
         # Validate the entry path without executing it; rebuild from live joints at start.
         self.approach(seed)
+        self.finish_preview = self.finish_print(joints, cancelled)
+        self.finish_move = ({'kind': 'lift', 'distance_mm': settings.post_print_lift_mm}
+                            if settings.post_print_lift_mm else {'kind': 'home', **self.home} if self.home else None)
+        self.z_reference = {'mesh': settings.bed_probe_file, 'adjustment_mm': settings.bed_z_adjust_mm,
+                            'formula': 'bed surface + G-code Z + bed_z_adjust_mm'}
+
+    def finish_print(self, current_joints, cancelled=lambda: False):
+        def pump():
+            if cancelled(): raise RuntimeError('Post-print planning cancelled')
+        if self.planner.settings.post_print_lift_mm:
+            return lift_motion(self.planner.settings, self.planner.config, current_joints, pump)
+        return return_motions(self.planner.settings, self.planner.config, self.home,
+                              current_joints, self.print_top_mm, pump)
 
     def _pose(self, record, t):
         u = progress(record['profile'], t)
@@ -242,6 +262,8 @@ class TimedPath:
         for index, t in enumerate(times[1:]):
             if index % 32 == 0 and cancelled(): raise RuntimeError('Planning cancelled')
             point, rotation = self._pose(record, t)
+            if record['delta_e'] > 0 and record['start'][:2] != record['end'][:2]:
+                self.print_top_mm = max(self.print_top_mm, float(point[2]))
             joints = self.planner.solve(point, positions[-1], rotation)
             if np.max(abs(np.rad2deg(joints-positions[-1]))) > self.planner.config.max_joint_step_deg:
                 raise ValueError('Discontinuous IK branch')
@@ -267,6 +289,7 @@ class TimedPath:
 
         # check_motion includes cubic-interpolation extrema, joint velocity and acceleration.
         self.planner.check_motion(motion, pose_at=pose_at,
+            clock_rate=MAX_CLOCK_RATE,
             path_tolerance_mm=tolerance,
             timing_hint='reduce corner speed/JD, max_velocity/max_accel or angular limits in Klipper '
                         '[axisforge_sync] and rerun preflight; approach_duration_s '

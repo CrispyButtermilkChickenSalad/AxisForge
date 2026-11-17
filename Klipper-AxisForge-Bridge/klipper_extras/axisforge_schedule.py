@@ -161,6 +161,10 @@ def heater_check_options(value=None):
 
 def compile_job(text, limits, heaters, heater_checks=None, motion_options=None):
     """Parse the supported printer dialect; unknown commands never execute implicitly."""
+    # File-level acceleration may reduce the synchronized ceiling, never raise
+    # the commissioned machine limit or modify the caller's configuration.
+    limits = dict(limits)
+    configured_acceleration = limits['linear_acceleration']
     checks = heater_check_options(heater_checks)
     continuous = limits.get('continuous_motion',False)
     settings=corner_options(motion_options)
@@ -181,6 +185,7 @@ def compile_job(text, limits, heaters, heater_checks=None, motion_options=None):
     requested_peaks, ignored_heaters = {}, set()
     pending_duration, sequence = 0., 0
     warnings = []
+    fan_speed = None
 
     def flush():
         nonlocal pending, pending_duration, sequence
@@ -203,6 +208,20 @@ def compile_job(text, limits, heaters, heater_checks=None, motion_options=None):
         try:
             line = re.sub(r'\([^()]*\)', '', raw.split(';', 1)[0]).strip().upper()
             if not line:
+                continue
+            if line.startswith('SET_VELOCITY_LIMIT'):
+                match = re.fullmatch(r'SET_VELOCITY_LIMIT\s+ACCEL=([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:E[+-]?\d+)?)', line)
+                if not match:
+                    raise ValueError('Only SET_VELOCITY_LIMIT ACCEL=<positive number> is supported')
+                if entry is not None:
+                    raise ValueError('SET_VELOCITY_LIMIT must appear before the first XY entry move')
+                acceleration = finite(float(match[1]), 'ACCEL')
+                if acceleration <= 0:
+                    raise ValueError('ACCEL must be positive')
+                limits['linear_acceleration'] = min(acceleration, configured_acceleration)
+                if acceleration > configured_acceleration:
+                    warnings.append('Line %d: requested acceleration %g mm/s^2 capped at the configured %g mm/s^2'
+                                    % (number, acceleration, configured_acceleration))
                 continue
             if line.startswith('SET_PRESSURE_ADVANCE'):
                 match = re.fullmatch(r'SET_PRESSURE_ADVANCE\s+ADVANCE=([\d.]+)', line)
@@ -297,10 +316,16 @@ def compile_job(text, limits, heaters, heater_checks=None, motion_options=None):
                 operations.append({'kind':'heater', 'heater':heater, 'target':target,
                                    'wait':command in ('M109', 'M190'), 'source_line':number})
             elif command in ('M106', 'M107'):
-                flush()
                 value = words.get('S', 255)/255 if command == 'M106' else 0.
                 if words.get('P', 0) != 0 or not 0 <= value <= 1:
                     raise ValueError('Only the primary fan and S0..255 are supported')
+                # Repeating an unchanged fan setting is not a synchronization
+                # barrier. Keeping it used to add a new reserve/start lead while
+                # the unretracted nozzle sat at the previous specimen's end.
+                if value == fan_speed:
+                    continue
+                fan_speed = value
+                flush()
                 operations.append({'kind':'fan', 'speed':value, 'source_line':number})
             elif command in ('G4', 'M400'):
                 flush()

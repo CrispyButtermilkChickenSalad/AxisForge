@@ -15,7 +15,7 @@ import httpx
 import yaml
 
 from bridge_dashboard.config import Settings
-from bridge_dashboard.rosbridge import RosBridge
+from bridge_dashboard.rosbridge import RosBridge, RosServiceError
 from bridge_dashboard.sync_clients import RobotClient
 
 
@@ -69,6 +69,7 @@ class RobotConnection:
         self._graph_known = False
         self._driver_present = False
         self._checked_at = None
+        self._dashboard_reconnect_at = float('-inf')
         self._checks = []
         self._feedback = {}
         self.state, self.message = 'idle', 'Connect the robot driver to begin the arm checks.'
@@ -155,13 +156,35 @@ class RobotConnection:
                        'mode':('get_robot_mode','GetRobotMode'),
                        'loaded':('get_loaded_program','GetLoadedProgram')}
             async def query(key, endpoint, name):
-                try: details[key] = await self.ros.call_service('/dashboard_client/'+endpoint, 'ur_dashboard_msgs/srv/'+name)
+                try:
+                    try:
+                        details[key] = await self.ros.call_service('/dashboard_client/'+endpoint, 'ur_dashboard_msgs/srv/'+name)
+                    except RosServiceError as error:
+                        # RosBridge deliberately raises on success:false. Keep
+                        # its failure reply for the bounded reconnect decision.
+                        details[key] = error.values
+                    answer = str(details[key].get('answer', '')).lower()
+                    disconnected = (details[key].get('success') is False and
+                                    ('are you connected to the dashboard server' in answer or
+                                     'not connected' in answer))
+                    if disconnected and self.clock()-self._dashboard_reconnect_at >= 10.:
+                        self._dashboard_reconnect_at = self.clock()
+                        # A separate manual Dashboard TCP client can replace this
+                        # connection. Reconnect communication only; never Play,
+                        # power on, release brakes, or change the control mode.
+                        connected = await self.ros.call_service('/dashboard_client/connect', 'std_srvs/srv/Trigger')
+                        if connected.get('success') is True:
+                            details[key] = await self.ros.call_service('/dashboard_client/'+endpoint, 'ur_dashboard_msgs/srv/'+name)
                 except Exception: details[key] = {}
             # UR dashboard commands share one driver-side TCP connection.
             for key, values in queries.items(): await query(key, *values)
-        remote = details.get('remote',{}).get('remote_control')
-        mode = details.get('mode',{}).get('robot_mode',{}).get('mode')
-        check('Remote Control', remote, 'Remote selected' if remote is True else 'Select Remote in the pendant’s top-right menu')
+        remote_reply = details.get('remote',{})
+        mode_reply = details.get('mode',{})
+        remote = remote_reply.get('remote_control') if remote_reply.get('success') is not False else None
+        mode = mode_reply.get('robot_mode',{}).get('mode') if mode_reply.get('success') is not False else None
+        check('Remote Control', remote, 'Remote selected' if remote is True else
+              'Select Remote in the pendant’s top-right menu' if remote is False and details.get('remote',{}).get('success') is not False else
+              'Waiting for the UR dashboard connection')
         check('Arm power / brakes', mode==7 if mode is not None else None,
               {3:'Power on the arm using the pendant',4:'Arm is powering on',5:'Release brakes using the pendant',
                7:'Arm powered; brakes released'}.get(mode,'Awaiting the arm’s power state'))

@@ -14,6 +14,22 @@ ENTRY = 'G21\nG90\nG0 X110 Y110 Z5 F600\n'
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_repeated_fan_setting_does_not_split_continuous_motion(self):
+        limits=dict(LIMITS,continuous_motion=True,extrusion_corner_velocity=1.)
+        header='M104 S200\n'+ENTRY+'M83\nM106 S128\n'
+        repeated=compile_job(header+'G1 X111 E.1\nM106 S128\nG1 X112 E.1\nM107\n',limits,HEATERS)
+        single=compile_job(header+'G1 X111 E.1\nG1 X112 E.1\nM107\n',limits,HEATERS)
+        chunks=[o for o in repeated['operations'] if o['kind']=='chunk']
+        self.assertEqual(len(chunks),1)
+        self.assertAlmostEqual(repeated['duration_s'],single['duration_s'])
+        self.assertEqual(sum(m['delta_e'] for m in chunks[0]['moves']),.2)
+        self.assertEqual([o['speed'] for o in repeated['operations'] if o['kind']=='fan'],[128/255,0.])
+        # A real change or explicit M400 remains a barrier.
+        for barrier in ('M106 S129','M400'):
+            p=compile_job(header+'G1 X111 E.1\n'+barrier+'\nG1 X112 E.1\n',limits,HEATERS)
+            self.assertEqual(len([o for o in p['operations'] if o['kind']=='chunk']),2)
+        with self.assertRaisesRegex(ValueError,'primary fan'):
+            compile_job(header+'M106 S128 P1\nG1 X111 E.1\n',limits,HEATERS)
     def test_shared_progress_for_xyz_abc_and_extrusion(self):
         plan = compile_job('M109 S200\n'+ENTRY+'G1 X120 A5 B-3 C2 E1\n',LIMITS,HEATERS)
         move = plan['operations'][-1]['moves'][0]
@@ -67,6 +83,33 @@ class ScheduleTests(unittest.TestCase):
     def test_pressure_advance_must_match_host(self):
         with self.assertRaisesRegex(ValueError,'Pressure advance'):
             compile_job('SET_PRESSURE_ADVANCE ADVANCE=1\n'+ENTRY+'G1 X111',LIMITS,HEATERS)
+
+    def test_file_acceleration_is_capped_without_changing_machine_or_path(self):
+        original=dict(LIMITS)
+        for continuous in (False,True):
+            limits=dict(LIMITS,continuous_motion=continuous)
+            normal=compile_job(ENTRY+'G1 X120\n',limits,HEATERS)
+            capped=compile_job('SET_VELOCITY_LIMIT ACCEL=2000\n'+ENTRY+'G1 X120\n',limits,HEATERS)
+            slow=compile_job('SET_VELOCITY_LIMIT ACCEL=2\n'+ENTRY+'G1 X120\n',limits,HEATERS)
+            self.assertEqual(capped['duration_s'],normal['duration_s'])
+            self.assertEqual(capped['limits']['linear_acceleration'],limits['linear_acceleration'])
+            self.assertTrue(any('capped at the configured' in w for w in capped['warnings']))
+            self.assertEqual(slow['limits']['linear_acceleration'],2.)
+            self.assertGreater(slow['duration_s'],normal['duration_s'])
+            move=next(o for o in slow['operations'] if o['kind']=='chunk')['moves'][0]
+            self.assertLessEqual(move['profile']['acceleration']*math.dist(move['start'][:3],move['end'][:3]),2.+1e-8)
+            self.assertEqual(limits['linear_acceleration'],original['linear_acceleration'])
+        self.assertEqual(LIMITS,original)
+
+    def test_unsupported_or_mid_print_velocity_changes_fail_explicitly(self):
+        for header in ('SET_VELOCITY_LIMIT ACCEL=0','SET_VELOCITY_LIMIT ACCEL=-1',
+                       'SET_VELOCITY_LIMIT ACCEL=1E999','SET_VELOCITY_LIMIT ACCEL=NaN',
+                       'SET_VELOCITY_LIMIT VELOCITY=20','SET_VELOCITY_LIMIT ACCEL=20 ACCEL=10',
+                       'SET_VELOCITY_LIMIT ACCEL=20 SQUARE_CORNER_VELOCITY=5'):
+            with self.subTest(header=header),self.assertRaises(ValueError):
+                compile_job(header+'\n'+ENTRY+'G1 X120\n',LIMITS,HEATERS)
+        with self.assertRaisesRegex(ValueError,'before the first XY'):
+            compile_job(ENTRY+'G1 X120\nSET_VELOCITY_LIMIT ACCEL=2\nG1 X125\n',LIMITS,HEATERS)
 
     def test_missing_bed_is_allowed_only_for_off_command(self):
         heaters = {'extruder':HEATERS['extruder']}

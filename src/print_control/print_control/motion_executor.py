@@ -87,6 +87,10 @@ class MotionExecutor(Node):
         if self.stop_requested or not rclpy.ok():
             raise RuntimeError('Printing interrupted')
 
+    def spin_feedback(self, timeout_sec):
+        """Service ROS; probing overrides this to keep a fair callback queue."""
+        rclpy.spin_once(self, timeout_sec=timeout_sec)
+
     def wait_until(self, predicate, timeout, description):
         """Process callbacks until a condition, interruption or deadline."""
         deadline = time.monotonic() + timeout
@@ -96,7 +100,7 @@ class MotionExecutor(Node):
                 return
             if time.monotonic() >= deadline:
                 raise RuntimeError(f'Timeout: {description}')
-            rclpy.spin_once(self, timeout_sec=0.02)
+            self.spin_feedback(0.02)
 
     def set_extrusion(self, speed, force=False):
         """Publish changes or stops; suppress nonzero output while aborting."""
@@ -225,7 +229,7 @@ class MotionExecutor(Node):
                     raise RuntimeError('Extruder subscriber disconnected')
                 self.stream_extrusion(extrusion, now - started)
                 timeout = self.extrusion_poll_timeout(started)
-            rclpy.spin_once(self, timeout_sec=timeout)
+            self.spin_feedback(timeout)
         self.motion_token = None
         response = self.result_future.result()
         if (response.status != GoalStatus.STATUS_SUCCEEDED or
@@ -256,7 +260,7 @@ class MotionExecutor(Node):
                 if self.speed_publisher.get_subscription_count() == 0:
                     raise RuntimeError('Extruder disconnected during extrusion completion')
                 self.stream_extrusion(extrusion, elapsed)
-                rclpy.spin_once(self, timeout_sec=self.extrusion_poll_timeout(started))
+                self.spin_feedback(self.extrusion_poll_timeout(started))
         self.set_extrusion(0.0, force=True)
         # Require a new joint sample before checking the end of this phase.
         previous_sample = self.joint_received
@@ -282,7 +286,7 @@ class MotionExecutor(Node):
         if self.goal_future is not None and self.goal_handle is None:
             while not self.goal_future.done() and time.monotonic() < deadline:
                 self.set_extrusion(0.0, force=True)
-                rclpy.spin_once(self, timeout_sec=0.02)
+                self.spin_feedback(0.02)
             if self.goal_future.done():
                 self.goal_handle = self.goal_future.result()
             else:
@@ -297,7 +301,7 @@ class MotionExecutor(Node):
                 cancel = self.goal_handle.cancel_goal_async()
                 while time.monotonic() < deadline and not self.result_future.done():
                     self.set_extrusion(0.0, force=True)
-                    rclpy.spin_once(self, timeout_sec=0.02)
+                    self.spin_feedback(0.02)
                 if not self.result_future.done():
                     self.get_logger().error(
                         'Trajectory termination not confirmed. Use pendant stop.'
@@ -310,4 +314,4 @@ class MotionExecutor(Node):
         if self.speed_publisher is not None:
             for _ in range(5):
                 self.set_extrusion(0.0, force=True)
-                rclpy.spin_once(self, timeout_sec=0.02)
+                self.spin_feedback(0.02)

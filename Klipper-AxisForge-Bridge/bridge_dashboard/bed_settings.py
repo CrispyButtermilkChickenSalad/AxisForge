@@ -87,6 +87,9 @@ class BedSettings:
     def status(self):
         raw = self._read()
         _, _, params, _, size, margin = parse(raw)
+        corner = [params[k]+(size[i]/2 if params['origin_at_center'] else 0.)
+                  for i,k in enumerate(('x_offset','y_offset'))]
+        frame = None
         mesh = {'requires_probe': False, 'message': 'No bed map configured; the flat-bed settings apply.'}
         if params.get('bed_probe_file'):
             try:
@@ -96,15 +99,35 @@ class BedSettings:
                          all(type(v) in (int,float) and math.isfinite(v) and abs(v-w) <= .001
                              for v,w in zip(recorded,size)))
                 valid = measured.get('simulated') is not True and measured.get('complete') is not False
+                recorded_model = measured.get('kinematic_model', {'kind':'nominal_ur16e'})
+                if not isinstance(recorded_model, dict):
+                    raise ValueError('Invalid bed model provenance')
+                if params.get('kinematics_file'):
+                    digest = hashlib.sha256(Path(params['kinematics_file']).expanduser().read_bytes()).hexdigest()
+                    valid = valid and recorded_model.get('kind') == 'ur_calibration' and recorded_model.get('sha256') == digest
+                else:
+                    valid = valid and recorded_model == {'kind':'nominal_ur16e'}
+                if 'bed_frame' in measured:
+                    frame = measured['bed_frame']
+                    centre, yaw = frame['center_base_mm'], frame['yaw_deg']
+                    if (frame.get('source') != 'homing_center' or len(centre) != 2 or
+                            not all(type(v) in (int,float) and math.isfinite(v) for v in centre) or
+                            type(yaw) not in (int,float) or not math.isfinite(yaw) or not -180 <= yaw <= 180 or
+                            frame['size_mm'] != recorded):
+                        raise ValueError('Invalid measured bed frame')
+                    angle = math.radians(yaw)
+                    x,y = (-v/2 for v in recorded)
+                    corner = [centre[0]+math.cos(angle)*x-math.sin(angle)*y,
+                              centre[1]+math.sin(angle)*x+math.cos(angle)*y] if match and valid else None
                 mesh = {'requires_probe': not (match and valid),
                         'message': 'Bed map dimensions match; preflight still checks coverage and TCP.' if match and valid else
-                                   'Bed dimensions differ from the saved mesh. Run Home & probe bed before printing.'}
+                                   'Bed dimensions or robot model differ from the saved mesh. Run Home & probe bed before printing.'}
             except (OSError, KeyError, TypeError, ValueError, yaml.YAMLError):
+                corner, frame = None, None
                 mesh = {'requires_probe': True, 'message': 'Bed map missing or invalid. Run Home & probe bed before printing.'}
         return {'revision': hashlib.sha256(raw).hexdigest(), 'bed_size_mm': size,
                 'probe_margin_mm': margin, 'probe_area': {'x': [margin,size[0]-margin], 'y': [margin,size[1]-margin]},
-                'front_left_base_mm': [params[k]+(size[i]/2 if params['origin_at_center'] else 0.)
-                                       for i,k in enumerate(('x_offset','y_offset'))], 'bed_mesh': mesh}
+                'front_left_base_mm': corner, 'bed_frame': frame, 'bed_mesh': mesh}
 
     def save(self, width, depth, margin, revision, invalidate):
         size, margin = dimensions(width, depth, margin)

@@ -65,6 +65,7 @@ __pycache__/
 /.docker/
 /.env
 /.axisforge-robot-control.lock
+/.axisforge-controller-build.lock
 **/*.tcp-backup
 **/*.probing-backup
 **/*.bed-backup
@@ -72,3 +73,5 @@ __pycache__/
 **/bed_probe.simulated.yaml
 **/bed_probe.simulated.pending.yaml
 **/bed_probe.yaml.*.bak
+**/*.contact-failure.json
+**/*.contact-failure.json.tmp

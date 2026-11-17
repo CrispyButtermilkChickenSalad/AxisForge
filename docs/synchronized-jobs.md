@@ -195,3 +195,17 @@ and exercise fallback search, configured limits and geometry/acceleration errors
 The Bridge suite exercises the real Klipper extra against nonactuating heater/MCU
 and robot doubles, including heater shutoff before IK and the two-phase commit.
 These tests do not measure physical tracking accuracy or stop latency.
+
+## Current validation status — 17 November 2026
+
+Clock alignment remains an open issue. The latest stationary check with concurrent
+status traffic exceeded the unchanged 10 ms guard after approximately 246 seconds
+(10.13 ms reported alignment, including 4.18 ms measurement uncertainty).
+Inter-host rate measurement and clock diagnostics are included, but this is not
+a verified fix for long synchronized prints. A complete print has not been
+validated with these changes. Heaters and robot motion were not commanded by
+that timing test.
+
+Run fresh homing/mesh capture for the actual cell before printing. Saved meshes,
+uploaded jobs, credentials and diagnostic captures from the development machine
+are not included in this update.

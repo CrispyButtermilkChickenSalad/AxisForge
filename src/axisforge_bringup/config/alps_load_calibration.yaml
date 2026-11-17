@@ -1,9 +1,10 @@
-# Raw counts only. Before contact, select max(8000, 4.1 * measured peak-to-peak
-# noise), capped at 20000. These are commissioning values, not factory defaults.
+# Raw counts only. Before contact, select max(8000, ceil(factor * peak-to-peak
+# noise)), capped at 20000. Factor is 4.1 cold or 2.5625 for explicitly hot
+# calibration; drift and unloaded-load guards still apply. Commissioning values.
 contact:
   trigger_mode: raw
   contact_delta_counts: 20000.0
-  max_delta_counts: 60000.0
+  max_delta_counts: 120000.0
   step_mm: 0.01
   speed_mm_s: 0.1
   retract_mm: 5.0

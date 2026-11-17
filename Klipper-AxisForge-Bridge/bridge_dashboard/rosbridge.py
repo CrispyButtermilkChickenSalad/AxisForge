@@ -11,6 +11,14 @@ import websockets
 logger = logging.getLogger(__name__)
 
 
+class RosServiceError(RuntimeError):
+    """Preserve a failed service reply so callers can diagnose transport loss."""
+    def __init__(self, service, values):
+        self.service, self.values = service, dict(values)
+        detail = str(values.get('answer') or values.get('message') or 'request failed')
+        super().__init__('Robot did not answer '+service+': '+detail)
+
+
 class RosBridge:
     """Maintain a reconnecting rosbridge connection and expose joint-state health."""
 
@@ -106,8 +114,10 @@ class RosBridge:
             if not response.get('result'):
                 raise RuntimeError('ROS service unavailable: '+service)
             values = response.get('values', {})
-            if not isinstance(values, dict) or values.get('success') is False:
+            if not isinstance(values, dict):
                 raise RuntimeError('Robot did not answer '+service)
+            if values.get('success') is False:
+                raise RosServiceError(service, values)
             return values
         finally:
             self._service_requests.pop(request_id, None)
@@ -128,17 +138,33 @@ class RosBridge:
         """Independent stop path, including when the robot worker process is lost."""
         if not self._connected or self._socket is None:
             raise RuntimeError('ROS disconnected; UR program stop could not be sent')
-        import uuid
-        request_id = 'sync-stop-'+uuid.uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self._service_requests[request_id] = future
         try:
-            async with self._send_lock:
-                await self._socket.send(json.dumps({'op':'call_service','id':request_id,
-                    'service':'/dashboard_client/stop','type':'std_srvs/srv/Trigger','args':{}}))
-            response = await asyncio.wait_for(future,3.)
-            if not response.get('result') or not response.get('values',{}).get('success'):
-                raise RuntimeError('UR dashboard did not acknowledge program stop')
-            return {'stopped':True}
-        finally:
-            self._service_requests.pop(request_id,None)
+            reply = await self.call_service('/dashboard_client/stop','std_srvs/srv/Trigger',timeout=2.)
+        except RosServiceError as first:
+            # The controller may report Remote while its old Dashboard TCP
+            # session still has Local permissions. Reconnect only on the explicit
+            # controller instruction, and only after confirming Remote. Never
+            # change mode, unlock, Play, or treat a rejected Stop as success.
+            detail = str(first.values.get('message') or first.values.get('answer') or first)
+            if 'reconnect to port 29999' not in detail.lower():
+                raise RuntimeError('UR dashboard did not acknowledge program stop: '+detail) from first
+            try:
+                remote = await self.call_service('/dashboard_client/is_in_remote_control',
+                    'ur_dashboard_msgs/srv/IsInRemoteControl')
+                if remote.get('remote_control') is not True:
+                    raise RuntimeError('Remote Control is not selected; use the pendant to stop')
+                # This driver refuses connect() while its socket is open, even
+                # when that socket retains the previous Local permissions.
+                closed = await self.call_service('/dashboard_client/quit','std_srvs/srv/Trigger')
+                if closed.get('success') is not True:
+                    raise RuntimeError('Dashboard disconnect was not acknowledged')
+                connected = await self.call_service('/dashboard_client/connect','std_srvs/srv/Trigger')
+                if connected.get('success') is not True:
+                    raise RuntimeError('Dashboard reconnect was not acknowledged')
+                reply = await self.call_service('/dashboard_client/stop','std_srvs/srv/Trigger',timeout=2.)
+            except Exception as error:
+                raise RuntimeError('UR dashboard did not acknowledge program stop: '+detail+
+                                   '; reconnect/retry: '+str(error)) from error
+        if reply.get('success') is not True:
+            raise RuntimeError('UR dashboard did not acknowledge program stop: unsuccessful service response')
+        return {'stopped':True}

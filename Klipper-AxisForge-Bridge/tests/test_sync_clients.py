@@ -15,6 +15,15 @@ from bridge_dashboard.sync_clients import MasterClient, RobotClient, Participant
 
 
 class ClockTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_background_monitor_only_reads_clocks_and_is_closed_cleanly(self):
+        self.master.start_clock_monitor()
+        monitor=self.master._clock_monitor
+        await asyncio.wait_for(self.received.wait(),1.)
+        await self.master.close()
+        self.assertTrue(monitor.done())
+        self.assertTrue(all(r['method']=='printer.axisforge_sync.clock' for r in self.requests))
+        self.assertIsNone(self.master._clock_monitor)
+
     async def asyncSetUp(self):
         self.connections = []
         self.requests = []

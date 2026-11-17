@@ -109,6 +109,12 @@ def main():
         expect(page.locator('#clock-speed-note')).to_contain_text('Above the illustrative allowance')
         expect(page.locator('#clock-measurement')).to_contain_text('running alignment 13.00 ms')
         cases.append('planned speed warning and measured alignment visible')
+        state['tracking']={'samples':100,'max_position_error_mm':.6,'max_z_error_mm':.05,
+                           'mean_estimated_lag_ms':30.}
+        page.evaluate('refreshSync()')
+        expect(page.locator('#print-tracking')).to_contain_text('maximum Z error 0.050 mm')
+        expect(page.locator('#print-tracking')).to_contain_text('motion lag 30.0 ms')
+        cases.append('physical motion tracking is separate from network clock alignment')
         state['heartbeat']={'active':True,'lease_mode':'cold_preflight','last_reply_ms':501.,
                             'cold_retries':2,'max_event_loop_delay_ms':3.,'retrying':True}
         page.evaluate('refreshSync()')

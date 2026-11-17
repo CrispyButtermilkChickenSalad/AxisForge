@@ -18,7 +18,9 @@ class LoadCalibrationControl(ProbeControl):
         self.action = None
 
     def ingest(self, command):
-        if not isinstance(command, dict) or command.get('command') not in ('step', 'finish'):
+        if self.z_mode is not None:
+            return super().ingest(command)
+        if not isinstance(command, dict) or command.get('command') not in ('step', 'record', 'finish'):
             return super().ingest(command)
         with self.lock:
             self.check()
@@ -29,6 +31,10 @@ class LoadCalibrationControl(ProbeControl):
                 delta = command.get('delta_mm')
                 if type(delta) not in (int, float) or not math.isfinite(delta) or abs(delta) not in STEP_SIZES:
                     raise ValueError('Invalid baby-step distance')
+            elif command['command'] == 'record':
+                grams = command.get('grams')
+                if type(grams) not in (int, float) or not math.isfinite(grams) or not 50 <= grams <= 25000:
+                    raise ValueError('Enter the actual scale reading in grams (50..25000)')
             self.action = dict(command)
             self.action_token = None
             return True
@@ -48,7 +54,7 @@ class LoadCalibrationControl(ProbeControl):
                         self.action_token = secrets.token_hex(16)
                         self.action_deadline = self.clock()+10.
                         self.emit('adjusting_load', 'Use one Z step at a time and read the weighing scale. '
-                                  'Record two distinct stable loads in ALPS Logger → Calibration.',
+                                  'Record the stable scale reading here, release the load with Up, then save calibration.',
                                   action_token=self.action_token, **values())
                 pump()
         finally:

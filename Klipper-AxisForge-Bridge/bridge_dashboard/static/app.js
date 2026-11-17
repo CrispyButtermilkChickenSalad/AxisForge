@@ -12,6 +12,7 @@ function displayTemperature(value, target) {
 }
 
 let latestSystemsReady = false;
+let latestKlipperTemperatures = {};
 let latestSystemsReason = "Checking Klipper and robot connections.";
 let latestAxisForgeIdle = false;
 let selectedPreflightState = null;
@@ -23,7 +24,7 @@ let robotConnectionSnapshot = {busy:false}, robotConnectInFlight = false;
 let tcpSnapshot = null, tcpAvailable = false, tcpSaveInFlight = false, tcpRefreshInFlight = false;
 let tcpDirty = false, tcpConflict = false, tcpRequestVersion = 0;
 let probingSnapshot = null, probingAvailable = false, probingSaveInFlight = false, probingRefreshInFlight = false;
-let probingDirty = false, probingConflict = false, probingRequestVersion = 0;
+let probingDirty = false, probingConflict = false, probingRequestVersion = 0, probingEditVersion = 0;
 let bedSettingsSnapshot = null, bedSettingsAvailable = false, bedSettingsSaveInFlight = false, bedSettingsRefreshInFlight = false;
 let bedSettingsDirty = false, bedSettingsConflict = false, bedSettingsRequestVersion = 0;
 let jobTransferInFlight = false;
@@ -41,6 +42,7 @@ const consumedProbeConfirmations = new Set();
 let visibleProbeConfirmation = null;
 let probeConfirmationReadyAt = 0;
 let uncertainProbeConfirmation = null;
+let uncertainProbeActionToken = null;
 
 function showMessage(id, text, isError = false) {
   const element = byId(id);
@@ -54,7 +56,12 @@ async function request(path, options = {}) {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const detail = Array.isArray(body.detail) ? body.detail.map(error =>
+      [error.loc?.filter(part => part !== "body").join("."), error.msg].filter(Boolean).join(": ")
+    ).join("; ") : body.detail;
+    throw new Error(detail || `Request failed (${response.status})`);
+  }
   return body;
 }
 
@@ -63,6 +70,7 @@ async function refreshStatus() {
     const status = await request("/api/status");
     const ros = status.ros;
     const klipper = status.klipper;
+    latestKlipperTemperatures = {extruder:klipper.extruder, heater_bed:klipper.bed};
     const job = status.axisforge;
     const allReady = ros.connected && klipper.connected && klipper.state === "ready";
     latestSystemsReady = Boolean(allReady && ros.joint_state_fresh);
@@ -497,8 +505,12 @@ function updateClockOptions() {
   }
   byId("clock-speed-note").textContent = guidance;
   const measurement = syncSnapshot.clock_measurement;
+  const tracking = syncSnapshot.tracking;
+  byId("print-tracking").textContent = tracking?.samples ?
+    `Measured robot tracking: maximum nozzle error ${Number(tracking.max_position_error_mm).toFixed(3)} mm · maximum Z error ${Number(tracking.max_z_error_mm).toFixed(3)} mm${tracking.mean_estimated_lag_ms == null ? "" : ` · mean estimated motion lag ${Number(tracking.mean_estimated_lag_ms).toFixed(1)} ms`}. These compare joint feedback with the commanded path; they are separate from network clock alignment. They do not measure filament flow or nozzle deflection.` :
+    "Physical nozzle tracking will be measured during the next synchronized print. Clock alignment alone does not measure robot response delay.";
   byId("clock-measurement").textContent = measurement
-    ? `Last clock check (${syncSnapshot.job || "job"}, ${measurement.age_s.toFixed(1)} s ago): uncertainty ${measurement.uncertainty_ms.toFixed(2)} ms${measurement.alignment_error_ms == null ? "" : `; running alignment ${measurement.alignment_error_ms.toFixed(2)} ms`}. Recorded limits: ${syncSnapshot.clock_options.max_uncertainty_ms}/${syncSnapshot.clock_options.max_alignment_error_ms} ms.`
+    ? `Last clock check (${syncSnapshot.job || "job"}, ${measurement.age_s.toFixed(1)} s ago): uncertainty ${measurement.uncertainty_ms.toFixed(2)} ms${measurement.alignment_error_ms == null ? "" : `; running alignment ${measurement.alignment_error_ms.toFixed(2)} ms`}${Number.isFinite(measurement.print_clock_rate_ppm) ? `; print clock rate ${measurement.print_clock_rate_ppm.toFixed(1)} ppm` : ""}${measurement.rate_source === "measured_between_hosts" ? ` (measured between hosts over ${measurement.host_rate_span_s.toFixed(0)} s)` : ""}. Recorded limits: ${syncSnapshot.clock_options.max_uncertainty_ms}/${syncSnapshot.clock_options.max_alignment_error_ms} ms.`
     : "Clock measurements appear during preflight and execution.";
   const heartbeat = syncSnapshot.heartbeat;
   byId("heartbeat-measurement").textContent = heartbeat?.last_reply_ms == null ? ""
@@ -672,33 +684,155 @@ function updateSyncControls() {
   updateSetupControls();
 }
 
+function zStage(body) {
+  return ["positioning_z", "recovering_z", "z_stepping", "z_step_rejected"].includes(body.state);
+}
+
+function zControlsReason(body, available, inFlight, consumed) {
+  if (!available || !body.configured) return "Z controls are unavailable because the routine status cannot be checked.";
+  if (!body.busy || body.stop_unconfirmed) return "This routine has stopped. Z controls require an active session with a confirmed stop and valid ALPS feedback.";
+  if (inFlight) return "Waiting for the current request; another Z step cannot be queued.";
+  if (!["positioning_z", "recovering_z"].includes(body.state)) return "Wait for the current movement or check to finish before choosing a Z step.";
+  const z = body.z_controls;
+  if (!z || z.phase !== (body.state === "positioning_z" ? "positioning" : "recovery") ||
+      !Array.isArray(z.position_mm) || z.position_mm.length !== 3 || !z.position_mm.every(Number.isFinite) ||
+      ![z.lower_z_mm, z.upper_z_mm, z.delta_counts].every(Number.isFinite) || z.lower_z_mm > z.upper_z_mm ||
+      ![z.loaded, z.upward_only, z.can_continue, z.can_finish].every(value => typeof value === "boolean") ||
+      !Array.isArray(z.step_sizes) || !z.step_sizes.length || !z.step_sizes.every(value => Number.isFinite(value) && value > 0)) {
+    return "Waiting for valid Z travel limits and load feedback.";
+  }
+  if (!body.action_token || consumed.has(body.action_token)) return "Waiting for fresh feedback after the last action before enabling another Z step.";
+  if (z.release_blocked) return "Up step stopped: ALPS load increased. Waiting for a fresh stable window below the original release ceiling. If this persists, stop and inspect the toolhead/contact direction.";
+  return "";
+}
+
+function zStepReason(body, delta) {
+  const z = body.z_controls;
+  if (!z || !Number.isFinite(delta) || !z.step_sizes?.includes(Math.abs(delta))) return "Choose a supported Z step size.";
+  if ((z.phase === "recovery" || z.upward_only || z.loaded) && delta < 0) return "Only upward release is available; Down is disabled.";
+  if (z.loaded && delta > .1) return "Load is applied. Use Up 0.1 mm or finer until fresh readings confirm release.";
+  const end = z.position_mm?.[2] + delta;
+  if (!Number.isFinite(end) || end < z.lower_z_mm - 1e-8 || end > z.upper_z_mm + 1e-8) return "This step exceeds the allowed Z range; choose a smaller step.";
+  return "";
+}
+
+function zStatusText(body) {
+  const z = body.z_controls;
+  if (z.release_blocked) return "Recovery is still active, but further Z steps are blocked until the load guard clears. No step repeats automatically.";
+  if (z.phase === "recovery") return `${z.failure ? `${z.failure} ` : ""}Upward recovery is available. ${z.loaded ? "Use Up 0.1 mm or finer to release contact." : "The nozzle is unloaded; lift clear, then finish recovery and start a fresh attempt."}`;
+  return z.loaded ? "Contact detected. Use Up 0.1 mm or finer to unload before continuing." :
+    "Z steps are available. Position the unloaded nozzle, then Continue to start the automatic search. Downward steps stop on contact.";
+}
+
+function zPositionText(body) {
+  const z = body.z_controls;
+  return z && Array.isArray(z.position_mm) && [z.position_mm[2], z.lower_z_mm, z.upper_z_mm, z.delta_counts].every(Number.isFinite) ?
+    `Nozzle Z: ${z.position_mm[2].toFixed(3)} mm · Allowed Z: ${z.lower_z_mm.toFixed(3)} to ${z.upper_z_mm.toFixed(3)} mm · Raw delta: ${z.delta_counts.toFixed(0)} counts` : "";
+}
+
+function probeThermalOptions() {
+  if (!byId("probe-heated").checked) return null;
+  return {nozzle_target_c:Number(byId("probe-nozzle-target").value), bed_target_c:Number(byId("probe-bed-target").value), soak_s:Number(byId("probe-soak").value)};
+}
+
+function probeThermalValid() {
+  const t=probeThermalOptions();
+  return t===null || [t.nozzle_target_c,t.bed_target_c,t.soak_s].every(Number.isFinite) &&
+    (t.nozzle_target_c===0 || t.nozzle_target_c>=50 && t.nozzle_target_c<=300) &&
+    (t.bed_target_c===0 || t.bed_target_c>=30 && t.bed_target_c<=150) && t.soak_s>=5 && t.soak_s<=1800 &&
+    t.nozzle_target_c+t.bed_target_c>0;
+}
+
+function probeStartPayload(dryRun) {
+  const thermal=probeThermalOptions();
+  return {dry_run:dryRun,...(thermal ? {thermal} : {})};
+}
+
 function updateBedProbeControls() {
   const body = bedProbeSnapshot;
   const busy = Boolean(body.busy);
-  const occupied = busy || setupBusy() || bedProbeActionInFlight || syncActionInFlight || syncSnapshot.busy || !latestAxisForgeIdle;
+  const occupied = busy || body.stop_unconfirmed || setupBusy() || bedProbeActionInFlight || syncActionInFlight || syncSnapshot.busy || !latestAxisForgeIdle;
+  if (busy) {
+    const selected=body.thermal_options;
+    byId("probe-heated").checked=Boolean(selected && (selected.nozzle_target_c>0 || selected.bed_target_c>0));
+    if (selected) {
+      byId("probe-nozzle-target").value=selected.nozzle_target_c;
+      byId("probe-bed-target").value=selected.bed_target_c;
+      byId("probe-soak").value=selected.soak_s;
+    }
+  }
+  const thermal=probeThermalOptions();
+  const noBed=Array.isArray(syncSnapshot.configured_heaters) && !syncSnapshot.configured_heaters.includes("heater_bed");
+  byId("probe-thermal-fields").disabled=occupied;
+  byId("probe-thermal-inputs").hidden=!byId("probe-heated").checked;
+  byId("probe-bed-target").disabled=occupied;
+  byId("probe-copy-temperatures").disabled=occupied || !latestSystemsReady;
   const liveReason = !bedProbeAvailable ? "Bed-probe service is unavailable." :
     !body.configured ? "Configure AxisForge before homing." :
+    body.stop_unconfirmed ? "Robot stop is unconfirmed. Use the pendant to stop the arm and restore a verified stopped state before retrying." :
     occupied ? "Finish or stop the current operation before starting another routine." :
     bedSettingsDirty || bedSettingsConflict ? "Save or reload the bed dimensions before starting the routine." :
     probingDirty || probingConflict ? "Save or reload the homing settings before starting the routine." :
+    !probeThermalValid() ? "Enter nozzle 50–300°C, bed 30–150°C (0 means off), and a 5–1800 second soak." :
+    noBed && thermal?.bed_target_c>0 ? "Klipper has no configured bed heater. Set the probing bed target to 0." :
+    robotConnectionSnapshot.available === true && robotConnectionSnapshot.ready === false ?
+      (robotConnectionSnapshot.message || "Complete the robot connection checks before retrying.") :
     !latestSystemsReady ? latestSystemsReason :
     !syncSnapshot.robot_ready ? (syncSnapshot.robot_reason || "Check the robot connection and External Control program.") : "";
   byId("bed-probe-start").disabled = Boolean(liveReason);
-  byId("bed-probe-simulate").disabled = !bedProbeAvailable || !body.configured || occupied || probingDirty || probingConflict || bedSettingsDirty || bedSettingsConflict;
+  byId("bed-probe-start").textContent=body.saved_mesh?.available || body.state==="complete" && !body.dry_run ? "Redo homing & mesh" : "Home & probe bed";
+  const saved=body.saved_mesh;
+  const savedThermal=saved?.temperature;
+  const savedTemperatures=savedThermal?.options ? `Nozzle ${savedThermal.options.nozzle_target_c}°C · bed ${savedThermal.options.bed_target_c}°C · ${savedThermal.mode}.` : "Temperature was not recorded for this mesh.";
+  byId("bed-probe-saved-mesh").textContent=saved?.available ? `Saved mesh: ${saved.points} points · ${saved.stamp}. ${savedTemperatures} You can redo it while the robot is ready and idle. The new completed scan replaces it and keeps a backup; failed runs leave it unchanged.` : "A completed scan creates a new active mesh. You can repeat homing and meshing whenever needed.";
+  const temperatures=Object.entries(latestKlipperTemperatures).filter(([,v])=>Number.isFinite(v?.temperature)).map(([name,v])=>`${name === "extruder" ? "Nozzle" : "Bed"}: ${displayTemperature(v.temperature,v.target)}`).join(" · ");
+  const soaking=body.state==="waiting_temperature" && body.thermal ? ` · Stable ${Math.floor(body.thermal.stable_for_s || 0)}/${body.thermal.required_stable_s} s` : "";
+  byId("probe-thermal-status").textContent=temperatures+soaking+(noBed ? " · Bed heater not configured; use target 0." : "");
+  byId("bed-probe-simulate").disabled = !bedProbeAvailable || !body.configured || occupied || !probeThermalValid() || probingDirty || probingConflict || bedSettingsDirty || bedSettingsConflict;
+  const retryVisible = ["failed", "aborted"].includes(body.state);
+  const retry = byId("bed-probe-retry");
+  byId("bed-probe-recovery").hidden = !retryVisible;
+  retry.textContent = body.dry_run ? "Retry simulation" : "Retry homing";
+  retry.disabled = !retryVisible || Boolean(body.stop_unconfirmed) ||
+    (body.dry_run ? byId("bed-probe-simulate").disabled : byId("bed-probe-start").disabled);
+  byId("bed-probe-retry-guidance").textContent = body.dry_run ?
+    "Retry starts a fresh simulation with new confirmations. No hardware will move and the physical bed map stays unchanged." :
+    "Correct the reported fault and leave the nozzle clear of the surface and unloaded. Review the maximum Z search for the current position. Retry starts fresh checks and asks for surface confirmation again; it does not lift the arm or resume the interrupted movement.";
+  byId("bed-probe-retry-status").textContent = retry.disabled ?
+    (body.dry_run && !body.stop_unconfirmed ? "Finish the current operation and save any setup changes; the homing service must be available before retrying." : liveReason) :
+    "Ready to start a fresh attempt with the saved settings.";
   byId("bed-probe-abort").disabled = !busy || bedProbeActionInFlight;
-  byId("bed-probe-readiness").textContent = busy ? "Heater targets must stay off. Stop probing cancels motion without returning the arm." :
+  const heated=body.thermal?.mode==="heated" || body.thermal_options && (body.thermal_options.nozzle_target_c>0 || body.thermal_options.bed_target_c>0);
+  byId("bed-probe-readiness").textContent = busy ? `${heated ? "Maintain the selected Klipper heater targets throughout this run." : "Heater targets must stay off."} Stop probing cancels motion without returning the arm.` :
     liveReason || "Ready. The first click checks readiness; motion waits for your confirmation below.";
-  const labels = {idle:"Not run",starting:"Checking",waiting_surface:"Confirm surface",homing_fast:"Finding bed",homing_slow:"Fine contact",moving_front_left:"Moving to first point",waiting_front_left:"Confirm front-left",meshing:"Measuring mesh",returning:"Returning",complete:body.dry_run ? "Simulation complete" : "Mesh complete",failed:"Failed",aborted:"Stopped",stopping:"Stopping"};
+  const labels = {idle:"Not run",starting:"Checking",waiting_temperature:"Temperature soak",aligning_nozzle:"Aligning nozzle",checking_robot_limits:"Checking robot limits",waiting_surface:"Confirm surface",positioning_z:"Position nozzle",recovering_z:"Lift clear",z_stepping:"Moving Z",z_step_rejected:"Z step rejected",homing_fast:"Finding bed",homing_slow:"Fine contact",moving_front_left:"Moving to first point",waiting_front_left:"Confirm front-left",meshing:"Measuring mesh",returning:"Returning",recovering_home:"Returning Home after failure",complete:body.dry_run ? "Simulation complete" : "Mesh complete",failed:"Failed",aborted:"Stopped",stopping:"Stopping"};
   const label = labels[body.state] || body.state;
   setBadge("bed-probe-badge", label, body.state === "complete" && !body.dry_run ? true : ["failed","aborted"].includes(body.state) ? false : undefined);
   byId("step-home").textContent = body.state === "idle" ? "Locate the surface and measure its mesh" : `${body.dry_run ? "Simulation · " : ""}${label}`;
   byId("bed-probe-message").textContent = `${body.dry_run ? "Simulation: " : ""}${body.message || ""}`;
   byId("bed-probe-message").className = `inline-message${["failed","aborted"].includes(body.state) ? " error" : ""}`;
+  const alignment = body.alignment;
+  byId("bed-probe-alignment").textContent = alignment?.state === "aligned" ?
+    `Upright alignment complete: ${Number(alignment.angle_deg).toFixed(3)}° corrected; remaining error ${Number(alignment.residual_deg).toFixed(3)}°. The mesh returns to the corrected starting pose.` : "";
+  const issues = Array.isArray(body.failure_history) ? body.failure_history : body.last_failure ? [body.last_failure] : [];
+  byId("bed-probe-last-error").hidden = !issues.length;
+  byId("bed-probe-last-error").textContent = issues.length ? `Recent reported issues: ${issues.slice(-3).join(" · ")}` : "";
+  const recovery = body.failure_recovery;
+  byId("bed-probe-home-recovery").textContent = recovery?.state === "returned" ?
+    "The scan failed and the arm returned to its established Home. The previous valid mesh is unchanged. Retry homing starts a fresh scan." : recovery?.state === "blocked" ?
+    `Automatic Home return could not finish: ${recovery.reason}. The scan remains failed; follow the reported recovery instructions.` : recovery ?
+    "The scan failed. Automatic recovery is releasing contact and returning Home under the existing sensor and robot guards. Stop probing cancels recovery too." : "";
   const threshold = Number(body.trigger_value);
   const maximum = Number(body.max_value);
   const unit = body.trigger_unit || (body.trigger_mode === "raw" ? "counts" : "g");
-  byId("bed-probe-sensor").textContent = Number.isFinite(threshold) ?
+  const nativeTrigger = body.trigger_source === "klipper_probe";
+  const nativeForce = Number(body.trigger_force_g);
+  byId("bed-probe-sensor").textContent = nativeTrigger ?
+    `Native Klipper probe: ${Number.isFinite(nativeForce) && nativeForce > 0 ? `${nativeForce.toLocaleString()} g contact threshold` : "contact threshold unavailable; check native probe calibration"}${Number.isFinite(maximum) && maximum > 0 ? ` · independent ${unit === "counts" ? "raw " : ""}overload stop ${maximum.toLocaleString()} ${unit}` : ""}. Requires load-cell calibration; the ALPS stream still monitors freshness and overload.` : Number.isFinite(threshold) ?
     `${body.trigger_mode === "raw" ? "Raw sensor mode" : "Calibrated sensor mode"}: ${threshold.toLocaleString()} ${unit} contact threshold${Number.isFinite(maximum) ? ` · ${maximum.toLocaleString()} ${unit} stop threshold` : ""}${body.trigger_mode === "raw" ? ". Uses the unloaded starting baseline; no conversion to grams." : "."}` : "";
+  if (Number.isFinite(threshold) && Number.isFinite(body.baseline_noise_fraction)) {
+    byId("bed-probe-sensor").textContent += ` Unloaded sample-range limit: ${(threshold*body.baseline_noise_fraction).toLocaleString()} ${unit}.`;
+  }
   byId("bed-probe-progress-container").hidden = !busy && body.state !== "complete";
   byId("bed-probe-progress").value = body.progress || 0;
   const plannedPoints = body.total_points || (probingSnapshot ? probingSnapshot.settings.mesh_columns * probingSnapshot.settings.mesh_rows : "—");
@@ -714,19 +848,41 @@ function updateBedProbeControls() {
   byId("bed-probe-confirm").disabled = !requested || bedProbeActionInFlight || performance.now() < probeConfirmationReadyAt;
   if (requested) {
     const first = confirm.stage === "surface";
-    byId("bed-probe-confirm-title").textContent = first ? "Confirm the surface before descending" : "Confirm the front-left mesh point";
+    const needsAlignment = first && alignment?.required && alignment.state === "pending";
+    const searchLimit = Number(body.max_descent_mm);
+    byId("bed-probe-confirm-title").textContent = first ? needsAlignment ? "Confirm surface and upright alignment" : "Confirm the surface before descending" : "Confirm the front-left mesh point";
     byId("bed-probe-confirm-detail").textContent = `${body.dry_run ? "This is a simulation; no hardware will move. " : ""}${first ?
-      "Confirm the flat build surface is underneath the upright nozzle. The nozzle must be clean, cool, clear of the surface and unloaded. Keep the area clear; confirmation starts a vertical descent." :
+      `Confirm the nozzle is above the CENTRE of the flat bed. Its starting X/Y defines the mesh centre. The nozzle must be clean, ${heated ? "at the selected temperature," : "cool,"} clear of the surface and unloaded.${heated ? " The bed must tolerate the selected nozzle temperature." : ""}${needsAlignment ? ` Leave space around the toolhead for rotation. Confirmation authorizes a ${Number(alignment.angle_deg).toFixed(3)}° upright correction around the nozzle tip over at least ${Number(alignment.duration_s)} seconds (maximum ${Number(alignment.maximum_deg)}°). The tip is intended to stay in place. Z positioning enables after alignment is verified.` : " Confirmation enables Z positioning."} Choose Continue afterward to start the automatic search.${Number.isFinite(searchLimit) && searchLimit > 0 ? ` Maximum downward search from the adjusted position: ${searchLimit} mm.` : ""}` :
       "Confirm the nozzle is above the intended first mesh point and this is the front-leftmost position of the mesh. Confirmation starts the selected mesh scan."}`;
-    byId("bed-probe-confirm").textContent = first ? "Surface confirmed — begin Z homing" : "Front-left confirmed — probe mesh";
+    byId("bed-probe-confirm").textContent = first ? needsAlignment ? "Surface clear — align nozzle" : "Surface confirmed — enable Z positioning" : "Front-left confirmed — probe mesh";
     const position = body.position_mm;
     const grid = body.first_point;
     const positionText = Array.isArray(position) && position.length === 3 ?
       `Nozzle position in robot Base: X ${Number(position[0]).toFixed(2)}, Y ${Number(position[1]).toFixed(2)}, Z ${Number(position[2]).toFixed(2)} mm.` : "";
     const gridText = !first && Array.isArray(grid) && grid.length === 2 ?
       ` Mesh point in G-code: X ${Number(grid[0]).toFixed(2)}, Y ${Number(grid[1]).toFixed(2)} mm.` : "";
-    byId("bed-probe-position").textContent = positionText + gridText;
+    const offset = body.first_point_offset_mm;
+    const offsetText = !first && Array.isArray(offset) && offset.length === 2 ?
+      ` Offset from homed centre in Base: X ${Number(offset[0]).toFixed(2)}, Y ${Number(offset[1]).toFixed(2)} mm.` : "";
+    byId("bed-probe-position").textContent = positionText + gridText + offsetText;
   }
+  const zReason = zControlsReason(body, bedProbeAvailable, bedProbeActionInFlight, consumedProbeConfirmations);
+  byId("bed-z-status").textContent = zStage(body) ? zReason || zStatusText(body) :
+    busy && alignment?.state === "aligning" ? "Aligning upright; Z controls enable after the stopped pose and unloaded sensor are verified." :
+    ["failed", "aborted"].includes(body.state) ? "This attempt has stopped; its Z controls are closed. Dashboard release is offered only while a recoverable failure keeps the monitored session active." :
+    busy ? "Z positioning enables after the unloaded surface confirmation. Automatic homing and mesh motion must finish or stop before manual adjustment." :
+    "Start homing and confirm the unloaded surface to enable Z positioning.";
+  byId("bed-z-position").textContent = zStage(body) ? zPositionText(body) : "";
+  for (const button of document.querySelectorAll("[data-bed-z-step]")) {
+    const reason = zReason || zStepReason(body, Number(button.dataset.bedZStep));
+    button.disabled = Boolean(reason);
+    button.title = reason || "One click requests one Z move";
+  }
+  const z = zStage(body) ? body.z_controls : null;
+  byId("bed-z-continue").hidden = z?.phase !== "positioning";
+  byId("bed-z-continue").disabled = Boolean(zReason) || z?.can_continue !== true || z?.loaded !== false;
+  byId("bed-z-finish").hidden = z?.phase !== "recovery";
+  byId("bed-z-finish").disabled = Boolean(zReason) || z?.can_finish !== true || z?.loaded !== false;
 }
 
 async function refreshBedProbe() {
@@ -744,6 +900,10 @@ async function refreshBedProbe() {
         consumedProbeConfirmations.delete(uncertainProbeConfirmation.token);
       }
       uncertainProbeConfirmation = null;
+    }
+    if (uncertainProbeActionToken) {
+      if (result.action_token === uncertainProbeActionToken) consumedProbeConfirmations.delete(uncertainProbeActionToken);
+      uncertainProbeActionToken = null;
     }
     const finished = bedProbeSnapshot.busy && !result.busy;
     bedProbeSnapshot = result;
@@ -763,13 +923,15 @@ async function bedProbeAction(action, data = {}) {
   if (bedProbeActionInFlight) return;
   bedProbeActionInFlight = true;
   bedProbeRequestVersion++;
-  if (action === "start") { selectedPreflightState = null; uncertainProbeConfirmation = null; }
+  if (action === "start") { selectedPreflightState = null; uncertainProbeConfirmation = null; uncertainProbeActionToken = null; }
+  if (action === "action" && data.token) consumedProbeConfirmations.add(data.token);
   updateSyncControls();
   try {
     bedProbeSnapshot = await request(`/api/bed-probe/${action}`, {method:"POST",body:JSON.stringify(data)});
     bedProbeAvailable = true;
   } catch (error) {
     if (action === "confirm") uncertainProbeConfirmation = data;
+    if (action === "action" && data.token) uncertainProbeActionToken = data.token;
     bedProbeSnapshot.message = error.message;
     showMessage("bed-probe-message",error.message,true);
   } finally {
@@ -780,8 +942,18 @@ async function bedProbeAction(action, data = {}) {
   }
 }
 
-byId("bed-probe-start").addEventListener("click", () => bedProbeAction("start", {dry_run:false}));
-byId("bed-probe-simulate").addEventListener("click", () => bedProbeAction("start", {dry_run:true}));
+byId("bed-probe-start").addEventListener("click", () => bedProbeAction("start", probeStartPayload(false)));
+byId("bed-probe-simulate").addEventListener("click", () => bedProbeAction("start", probeStartPayload(true)));
+byId("bed-probe-retry").addEventListener("click", () => {
+  if (byId("bed-probe-retry").disabled || !["failed", "aborted"].includes(bedProbeSnapshot.state)) return;
+  bedProbeAction("start", probeStartPayload(bedProbeSnapshot.dry_run === true));
+});
+for (const id of ["probe-heated","probe-nozzle-target","probe-bed-target","probe-soak"]) byId(id).addEventListener("input",updateBedProbeControls);
+byId("probe-copy-temperatures").addEventListener("click",()=>{
+  const nozzle=Number(latestKlipperTemperatures.extruder?.target)||0, bed=Number(latestKlipperTemperatures.heater_bed?.target)||0;
+  byId("probe-nozzle-target").value=nozzle;byId("probe-bed-target").value=bed;
+  byId("probe-heated").checked=nozzle>0 || bed>0;updateBedProbeControls();
+});
 byId("bed-probe-abort").addEventListener("click", () => bedProbeAction("abort"));
 byId("bed-probe-confirm").addEventListener("click", () => {
   const confirmation = bedProbeSnapshot.confirmation;
@@ -789,6 +961,19 @@ byId("bed-probe-confirm").addEventListener("click", () => {
   consumedProbeConfirmations.add(confirmation.token);
   bedProbeAction("confirm", {stage:confirmation.stage, token:confirmation.token});
 });
+for (const button of document.querySelectorAll("[data-bed-z-step]")) {
+  button.addEventListener("click", () => {
+    const delta = Number(button.dataset.bedZStep);
+    if (button.disabled || zControlsReason(bedProbeSnapshot, bedProbeAvailable, bedProbeActionInFlight, consumedProbeConfirmations) || zStepReason(bedProbeSnapshot, delta)) return;
+    bedProbeAction("action", {command:"step", token:bedProbeSnapshot.action_token, delta_mm:delta});
+  });
+}
+for (const [id, command] of [["bed-z-continue", "continue"], ["bed-z-finish", "finish_recovery"]]) {
+  byId(id).addEventListener("click", () => {
+    if (byId(id).disabled || zControlsReason(bedProbeSnapshot, bedProbeAvailable, bedProbeActionInFlight, consumedProbeConfirmations)) return;
+    bedProbeAction("action", {command, token:bedProbeSnapshot.action_token});
+  });
+}
 
 async function loadPreflight() {
   const job = byId("job-select").value;
@@ -978,6 +1163,22 @@ window.setInterval(refreshStatus, 2000);
 window.setInterval(refreshTelemetry, 5000);
 window.addEventListener("resize", drawTemperatureHistory);
 
+function calibrationStartOptions() {
+  const value = id => byId(id).value.trim() === "" ? NaN : Number(byId(id).value);
+  return {calibration_max_counts: value("load-calibration-max-counts"),
+    calibration_hot_target: byId("load-calibration-hot").checked ? value("load-calibration-hot-target") : null};
+}
+
+function validCalibrationOptions(options) {
+  return Number.isFinite(options.calibration_max_counts) && options.calibration_max_counts >= 90000 && options.calibration_max_counts <= 250000 &&
+    (options.calibration_hot_target === null || (Number.isFinite(options.calibration_hot_target) && options.calibration_hot_target >= 50 && options.calibration_hot_target <= 300));
+}
+
+function calibrationMeasuredGrams() {
+  const value = byId("load-calibration-grams").value.trim();
+  return value === "" ? NaN : Number(value);
+}
+
 function updateSetupControls() {
   updateTcpControls();
   updateProbingControls();
@@ -999,15 +1200,32 @@ function updateSetupControls() {
   }));
   const occupied = Boolean(otherBusy || setupBusy());
   const unavailable = !loadCalibrationAvailable || !load.configured;
+  if (load.busy && Number.isFinite(load.calibration_max_counts)) {
+    byId("load-calibration-max-counts").value = load.calibration_max_counts;
+    byId("load-calibration-hot").checked = Number.isFinite(load.calibration_hot_target);
+    if (Number.isFinite(load.calibration_hot_target)) byId("load-calibration-hot-target").value = load.calibration_hot_target;
+  }
+  const hotSelected = byId("load-calibration-hot").checked;
+  const optionsValid = validCalibrationOptions(calibrationStartOptions());
+  byId("load-calibration-options").disabled = occupied;
+  byId("load-calibration-hot-target-label").hidden = !hotSelected;
+  byId("load-calibration-hot-guidance").hidden = !hotSelected;
+  byId("load-calibration-hot-target").disabled = !hotSelected || occupied;
   const reason = unavailable ? "Scale routine service is unavailable." : occupied ? "Finish or stop the current operation first." :
+    !optionsValid ? "Enter a calibration raw limit of 90,000–250,000 counts and, for hot mode, a target of 50–300°C." :
     !latestSystemsReady ? latestSystemsReason : !syncSnapshot.robot_ready ? (syncSnapshot.robot_reason || "Complete the robot checks first.") : "";
   byId("load-calibration-start").disabled = Boolean(reason);
-  byId("load-calibration-simulate").disabled = unavailable || occupied;
-  byId("load-calibration-abort").disabled = !load.busy || loadCalibrationInFlight;
-  byId("load-calibration-readiness").textContent = load.busy ? "Keep heater targets off and the nozzle cool. Stop cancels motion and holds position." : reason || "Ready. Motion starts only after the home and scale confirmations.";
-  setBadge("load-calibration-badge", `${load.dry_run ? "Simulation · " : ""}${load.state.replaceAll("_", " ")}`, ["failed","aborted"].includes(load.state) ? false : undefined);
+  byId("load-calibration-simulate").disabled = unavailable || occupied || !optionsValid;
+  byId("load-calibration-abort").disabled = !load.busy || loadCalibrationInFlight || ["saving_config","verifying_config"].includes(load.state);
+  byId("load-calibration-clear-session").disabled = unavailable || occupied || !latestSystemsReady;
+  const hotActive = load.hot_calibration || Number.isFinite(load.calibration_hot_target);
+  const savingCalibration = ["ready_to_save","saving_config","verifying_config"].includes(load.state);
+  byId("load-calibration-readiness").textContent = load.busy ? (savingCalibration ? "Saving calibration with heaters off. Keep the scale unloaded; the robot remains stationary." : hotActive ? "Maintain the selected manual nozzle target and keep clear of the hot contact area. Stop cancels motion and holds position." : "Keep heater targets off and the nozzle cool. Stop cancels motion and holds position.") : reason || "Ready. Confirm the current start pose and unloaded scale placement, then use Z positioning before continuing.";
+  setBadge("load-calibration-badge", `${load.dry_run ? "Simulation · " : ""}${load.state.replaceAll("_", " ")}`, ["failed","aborted","save_failed"].includes(load.state) ? false : load.state === "complete" ? true : undefined);
   byId("load-calibration-message").textContent = load.message || "";
   byId("load-calibration-sensor").textContent = Number.isFinite(load.trigger_value) ? `Contact: ${load.trigger_value.toFixed(0)} raw counts · Stop limit: ${load.max_value} counts. Live counts are refreshed after each move and while waiting.` : "Contact uses uncalibrated raw counts; no grams conversion is assumed.";
+  byId("load-calibration-temperature").textContent = load.busy && Number.isFinite(load.temperature_c) ?
+    `Nozzle: ${load.temperature_c.toFixed(1)}°C${Number.isFinite(load.target_c) ? ` · Target: ${load.target_c.toFixed(1)}°C` : ""}${load.state === "waiting_temperature" && Number.isFinite(load.stable_for_s) ? ` · Stable: ${load.stable_for_s.toFixed(0)}/${Number.isFinite(load.required_stable_s) ? load.required_stable_s : 30} s` : ""}.` : "";
   const confirmation = load.confirmation;
   const requested = loadCalibrationAvailable && load.busy && confirmation && !consumedCalibrationTokens.has(confirmation.token);
   if (requested && calibrationVisibleToken !== confirmation.token) {
@@ -1017,33 +1235,103 @@ function updateSetupControls() {
   byId("load-calibration-confirmation").hidden = !requested;
   byId("load-calibration-confirm").disabled = !requested || loadCalibrationInFlight || performance.now() < calibrationReadyAt;
   if (requested) {
-    const titles = {home:"Confirm the arm is at home", scale:"Confirm the scale is under the nozzle", tare:"Confirm the weighing scale is tared"};
-    const labels = {home:"Home position reached — continue", scale:"Scale placed — begin slow Z contact", tare:"Scale tared — enable Z baby steps"};
+    const titles = {home:"Confirm the current home/start pose", scale:"Confirm the scale is under the nozzle", tare:"Confirm the weighing scale is tared"};
+    const labels = {home:"Start pose confirmed — continue", scale:"Scale placed — enable Z positioning", tare:"Scale tared — enable load adjustment"};
     byId("load-calibration-confirm-title").textContent = titles[confirmation.stage];
     byId("load-calibration-confirm-detail").textContent = `${load.dry_run ? "Simulation only. " : ""}${load.message}`;
     byId("load-calibration-confirm").textContent = labels[confirmation.stage];
   }
-  byId("load-calibration-steps").hidden = !load.busy || !["adjusting_load","stepping","step_rejected"].includes(load.state);
-  const enabled = loadCalibrationAvailable && load.busy && !loadCalibrationInFlight && load.state === "adjusting_load" && load.action_token && !consumedCalibrationTokens.has(load.action_token);
+  byId("load-calibration-steps").hidden = !load.busy || !["adjusting_load","stepping","step_rejected","load_limit","recording_load"].includes(load.state);
+  const controlsReason = calibrationControlsReason();
+  const enabled = !controlsReason;
+  byId("load-calibration-z-status").textContent = controlsReason || (zStage(load) ? zStatusText(load) : load.upward_only || load.load_limit_reached ?
+    "Z release is available: use Up 0.1 mm or finer until the load clears." :
+    "Z steps are available. Use one click at a time; use 0.1 mm or finer to apply load.");
+  byId("load-calibration-z-status").className = `inline-message${["failed","aborted","save_failed"].includes(load.state) ? " error" : ""}`;
   const step = Number(byId("load-step-size").value);
   const upReason = calibrationStepReason(step), downReason = calibrationStepReason(-step);
   byId("load-step-size").disabled = !enabled;
   byId("load-step-up").disabled = !enabled || Boolean(upReason);
   byId("load-step-down").disabled = !enabled || Boolean(downReason);
-  byId("load-calibration-finish").disabled = !enabled;
+  for (const button of document.querySelectorAll("[data-calibration-step]")) {
+    const reason = calibrationStepReason(Number(button.dataset.calibrationStep));
+    button.disabled = !enabled || Boolean(reason);
+    button.title = controlsReason || reason || "One click requests one Z move";
+  }
+  const z = zStage(load) ? load.z_controls : null;
+  byId("load-z-navigation").hidden = !zStage(load);
+  byId("load-z-position").textContent = zStage(load) ? zPositionText(load) : "";
+  byId("load-z-continue").hidden = z?.phase !== "positioning";
+  byId("load-z-continue").disabled = !enabled || z?.can_continue !== true || z?.loaded !== false;
+  byId("load-z-finish").hidden = z?.phase !== "recovery";
+  byId("load-z-finish").disabled = !enabled || z?.can_finish !== true || z?.loaded !== false;
+  const releaseOnly = Boolean(load.upward_only || load.load_limit_reached);
+  const recordingEnabled = enabled && load.state === "adjusting_load";
+  const grams = calibrationMeasuredGrams();
+  byId("load-calibration-grams").disabled = !recordingEnabled || releaseOnly || load.calibration_recorded === true;
+  byId("load-calibration-record").disabled = !recordingEnabled || releaseOnly || load.calibration_recorded === true || load.unloaded !== false || !Number.isFinite(grams) || grams < 50 || grams > 25000;
+  byId("load-calibration-finish").disabled = !recordingEnabled || releaseOnly || load.calibration_recorded !== true || load.unloaded !== true;
+  byId("load-calibration-save-guidance").textContent = `${load.calibration_recorded !== true ? "Record a measured load first." : load.unloaded !== true || releaseOnly ? "Use Up until fresh readings confirm the scale is unloaded." : "The measured load is recorded and the scale is unloaded; calibration is ready to save."} Save turns heaters off and runs Klipper SAVE_CONFIG, which restarts Klipper. It does not move the robot.`;
+  const recordedGrams = Number.isFinite(load.recorded_grams) ? load.recorded_grams : load.calibrated_grams;
+  const calibrationDetails = [Number.isFinite(recordedGrams) && `${recordedGrams.toLocaleString()} g measured load`,
+    Number.isFinite(load.calibration_counts_per_gram) && `${load.calibration_counts_per_gram.toFixed(3)} counts/g`,
+    Number.isFinite(load.calibration_tare_counts) && `tare ${load.calibration_tare_counts.toFixed(0)} counts`].filter(Boolean).join(" · ");
+  byId("load-calibration-result").textContent = load.state === "complete" ? `${load.dry_run ? "Simulation complete; no calibration was saved." : "Calibration saved and verified in Klipper."}${calibrationDetails ? ` ${calibrationDetails}.` : ""}` : load.state === "save_failed" ? `Calibration save was not verified. ${load.message || "Keep the robot stationary and inspect the Klipper configuration before retrying."}` : ["ready_to_save","saving_config","verifying_config"].includes(load.state) ? "Saving and checking Klipper calibration. Keep the scale unloaded; Klipper will restart and the robot remains stationary." : load.calibration_recorded === true ? `Measured load recorded${calibrationDetails ? `: ${calibrationDetails}` : ""}. Release the load before saving.` : "";
+  byId("load-calibration-result").className = `inline-message${load.state === "save_failed" ? " error" : load.state === "complete" ? " success" : ""}`;
   byId("load-step-guidance").textContent = [upReason && `Up: ${upReason}`, downReason && `Down: ${downReason}`].filter(Boolean).join(" ") ||
-    "Both directions are available within the current travel limits. Use 0.05 mm or finer near contact.";
+    "Both directions are available within the current travel limits. Use 0.1 mm or finer near contact.";
   byId("load-calibration-position").textContent = Array.isArray(load.position_mm) ? `Nozzle Z: ${load.position_mm[2].toFixed(3)} mm · Allowed Z: ${load.lower_z_mm?.toFixed(3)} to ${load.upper_z_mm?.toFixed(3)} mm · Raw delta: ${load.delta_counts?.toFixed(0) || "—"} counts` : "";
+}
+
+function calibrationControlsReason() {
+  const load = loadCalibrationSnapshot;
+  if (!loadCalibrationAvailable || !load.configured) return "Z controls are unavailable: calibration status cannot be checked.";
+  if (!load.busy) {
+    if (["failed", "aborted", "save_failed"].includes(load.state)) {
+      const recovery = /native calibration is open|unfinished.*calibration/i.test(load.message || "") ?
+        " Use Clear unfinished Klipper calibration while idle, then start the scale routine again." :
+        " Resolve this error, then start the scale routine again.";
+      return `Z controls are unavailable because the routine stopped: ${load.message || load.state}.${recovery}`;
+    }
+    return "Start the scale routine and complete its confirmations to enable Z steps.";
+  }
+  if (load.stop_unconfirmed) return "Robot stop is unconfirmed; Z controls are unavailable.";
+  if (zStage(load)) return zControlsReason(load, loadCalibrationAvailable, loadCalibrationInFlight, consumedCalibrationTokens);
+  if (loadCalibrationInFlight) return "Waiting for the current calibration request; another Z step cannot be queued.";
+  const stages = {
+    starting: "Checking ALPS and Klipper before the scale routine. Z steps are not enabled yet.",
+    waiting_temperature: "Waiting for the selected temperature to stabilize. Z steps are not enabled yet.",
+    waiting_home: "Confirm the home/start pose above. Dashboard Z positioning follows unloaded scale placement confirmation.",
+    waiting_scale: "Confirm the scale is under the clear, unloaded nozzle. Confirmation enables Z positioning; Continue starts the automatic contact search.",
+    finding_scale: "Finding the scale automatically at 0.1 mm/s, with at most 20 mm descent. Z buttons enable after the lift and tare confirmation.",
+    retracting: "Lifting 5 mm at 0.5 mm/s to unload the scale. Wait for the tare confirmation before using Z steps.",
+    waiting_tare: "Tare the unloaded weighing scale, then confirm above. Klipper must record the unloaded reference before Z steps enable.",
+    stepping: "A Z step is in progress. Wait for it to finish before requesting another.",
+    step_rejected: "The requested step was rejected. Waiting for fresh position and load feedback before enabling another step.",
+    load_limit: "The calibration load limit was reached. Waiting for a confirmed stop before enabling small upward release steps.",
+    recording_load: "Recording the measured load in Klipper. Keep the arm and scale stationary.",
+    accepting_calibration: "Validating calibration with the load released. Z steps are finished for this routine.",
+    ready_to_save: "The robot routine has stopped. Preparing to save calibration; Z steps are finished.",
+    saving_config: "Saving calibration and restarting Klipper. Z steps are finished for this routine.",
+    verifying_config: "Verifying the saved calibration after Klipper restarts. Z steps are finished for this routine.",
+  };
+  if (load.state !== "adjusting_load") return stages[load.state] || "Waiting for the scale routine to reach Z adjustment.";
+  if (!load.action_token || consumedCalibrationTokens.has(load.action_token)) return "Waiting for fresh feedback after the last action before enabling another Z step.";
+  return "";
 }
 
 function calibrationStepReason(delta) {
   const load = loadCalibrationSnapshot;
+  if (zStage(load)) return zStepReason(load, delta);
+  const releaseOnly = load.upward_only || load.load_limit_reached;
+  if (releaseOnly && delta < 0) return "Calibration load limit reached; use Up to release the load.";
+  if (releaseOnly && delta > .1) return "Choose 0.1 mm or finer for upward load release.";
   const z = load.position_mm?.[2];
   if (![z, load.lower_z_mm, load.upper_z_mm, load.contact_z_mm].every(Number.isFinite)) return "Waiting for contact and travel limits.";
   if (![.001, .01, .05, .1, .5, 1, 10].includes(Math.abs(delta))) return "Choose a supported step size.";
   const end = z + delta;
   if (end < load.lower_z_mm - 1e-8 || end > load.upper_z_mm + 1e-8) return "This step exceeds the allowed Z range; choose a smaller step.";
-  if (delta < -.05 && end < load.contact_z_mm + .5 - 1e-8) return "Use 0.05 mm or finer within 0.5 mm of contact.";
+  if (delta < -.1 && end < load.contact_z_mm + .5 - 1e-8) return "Use 0.1 mm or finer within 0.5 mm of contact.";
   return "";
 }
 
@@ -1093,9 +1381,17 @@ byId("robot-connect").addEventListener("click", async () => {
   catch (error) { robotConnectionSnapshot.message = error.message; }
   finally { robotConnectInFlight = false; updateSyncControls(); refreshSetup(); }
 });
-byId("load-calibration-start").addEventListener("click", () => calibrationAction("start", {dry_run:false}));
-byId("load-calibration-simulate").addEventListener("click", () => calibrationAction("start", {dry_run:true}));
+for (const id of ["load-calibration-max-counts", "load-calibration-hot", "load-calibration-hot-target"]) byId(id).addEventListener("input", updateSetupControls);
+for (const [id, dryRun] of [["load-calibration-start", false], ["load-calibration-simulate", true]]) {
+  byId(id).addEventListener("click", () => {
+    const options = calibrationStartOptions();
+    if (!byId(id).disabled && validCalibrationOptions(options)) calibrationAction("start", {dry_run:dryRun, ...options});
+  });
+}
 byId("load-calibration-abort").addEventListener("click", () => calibrationAction("abort"));
+byId("load-calibration-clear-session").addEventListener("click", () => {
+  if (!byId("load-calibration-clear-session").disabled) calibrationAction("clear-session");
+});
 byId("load-calibration-confirm").addEventListener("click", () => {
   const value = loadCalibrationSnapshot.confirmation;
   if (value && !consumedCalibrationTokens.has(value.token)) calibrationAction("confirm", value);
@@ -1107,10 +1403,29 @@ for (const [id, direction] of [["load-step-up",1],["load-step-down",-1]]) {
     if (!byId(id).disabled && !calibrationStepReason(delta) && token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"step", token, delta_mm:delta});
   });
 }
+for (const button of document.querySelectorAll("[data-calibration-step]")) {
+  button.addEventListener("click", () => {
+    const token = loadCalibrationSnapshot.action_token;
+    const delta = Number(button.dataset.calibrationStep);
+    if (!button.disabled && !calibrationStepReason(delta) && token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"step", token, delta_mm:delta});
+  });
+}
+for (const [id, command] of [["load-z-continue", "continue"], ["load-z-finish", "finish_recovery"]]) {
+  byId(id).addEventListener("click", () => {
+    const token = loadCalibrationSnapshot.action_token;
+    if (byId(id).disabled || calibrationControlsReason() || !token || consumedCalibrationTokens.has(token)) return;
+    calibrationAction("action", {command, token});
+  });
+}
 byId("load-step-size").addEventListener("change", updateSetupControls);
+byId("load-calibration-grams").addEventListener("input", updateSetupControls);
+byId("load-calibration-record").addEventListener("click", () => {
+  const token = loadCalibrationSnapshot.action_token;
+  if (!byId("load-calibration-record").disabled && token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"record", token, grams:calibrationMeasuredGrams()});
+});
 byId("load-calibration-finish").addEventListener("click", () => {
   const token = loadCalibrationSnapshot.action_token;
-  if (token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"finish", token});
+  if (!byId("load-calibration-finish").disabled && token && !consumedCalibrationTokens.has(token)) calibrationAction("action", {command:"finish", token});
 });
 byId("calibration-open-logger").addEventListener("click", () => byId("alps-link").click());
 refreshSetup();
@@ -1195,18 +1510,22 @@ window.setInterval(refreshTcp, 5000);
 
 const probingInputs = {
   first_speed_mm_s: "probing-search-speed",
+  max_descent_mm: "probing-search-limit",
   second_speed_mm_s: "probing-fine-speed",
   lift_speed_mm_s: "probing-lift-speed",
   mesh_columns: "probing-mesh-columns",
   mesh_rows: "probing-mesh-rows",
+  mesh_yaw_deg: "probing-mesh-yaw",
   mesh_speed_mm_s: "probing-mesh-speed",
   mesh_samples: "probing-mesh-samples",
   mesh_repeatability_mm: "probing-repeatability",
 };
 const probingBounds = {
   first_speed_mm_s: [.5, 10], second_speed_mm_s: [.02, 1],
+  max_descent_mm: [5, 350],
   lift_speed_mm_s: [1, 20], mesh_columns: [2, 9], mesh_rows: [2, 9],
-  mesh_speed_mm_s: [.02, .2], mesh_samples: [3, 5], mesh_repeatability_mm: [.005, .05],
+  mesh_yaw_deg: [-180, 180],
+  mesh_speed_mm_s: [.02, .5], mesh_samples: [1, 5], mesh_repeatability_mm: [.005, .05],
 };
 
 function probingValues() {
@@ -1224,24 +1543,31 @@ function validProbingSettings(values) {
 function updateProbingControls() {
   const occupied = Boolean(setupBusy() || syncSnapshot.busy || syncActionInFlight || bedProbeSnapshot.busy || bedProbeActionInFlight || !latestAxisForgeIdle);
   const values = probingValues();
-  byId("probing-fine-speed").setCustomValidity(Number.isFinite(values.second_speed_mm_s) && Number.isFinite(values.first_speed_mm_s) &&
-    values.second_speed_mm_s >= values.first_speed_mm_s ? "Fine rehoming must be slower than the initial search." : "");
+  const initialValid = Number.isFinite(values.first_speed_mm_s) && values.first_speed_mm_s >= .5 && values.first_speed_mm_s <= 10;
+  const speedsReversed = Number.isFinite(values.second_speed_mm_s) && Number.isFinite(values.first_speed_mm_s) &&
+    values.second_speed_mm_s >= values.first_speed_mm_s;
+  byId("probing-fine-speed").setCustomValidity(speedsReversed ? "Fine rehoming must be slower than the initial search." : "");
+  const speedGuidance = byId("probing-speed-guidance");
+  speedGuidance.textContent = !initialValid ? "Enter an initial search speed from 0.5–10 mm/s. 5 mm/s is the default, not the minimum." :
+    speedsReversed ? "Fine rehoming must be slower than the initial search. Lower the fine speed before saving." :
+    "Initial search: 0.5–10 mm/s; 5 mm/s is the default, not the minimum. Fine rehoming must be slower. Click Save homing settings to apply changes to the next run.";
+  speedGuidance.className = !initialValid || speedsReversed ? "inline-message error" : "chart-caption";
   byId("probing-fields").disabled = occupied || !probingAvailable;
   byId("probing-save").disabled = occupied || !probingAvailable || !validProbingSettings(values) || !probingDirty || probingConflict;
   byId("probing-reload").disabled = probingSaveInFlight || probingRefreshInFlight;
   setBadge("probing-settings-badge", probingSaveInFlight ? "Saving…" : !probingAvailable ? "Unavailable" : occupied ? "Operation active" :
     probingConflict ? "Reload required" : probingDirty ? "Unsaved changes" : "Saved", probingConflict ? false : undefined);
   const saved = probingSnapshot?.settings;
-  byId("probing-saved").textContent = saved ? `Saved: initial ${saved.first_speed_mm_s} mm/s · fine ${saved.second_speed_mm_s} mm/s · upward ${saved.lift_speed_mm_s} mm/s · ${saved.mesh_columns}×${saved.mesh_rows} mesh (${saved.mesh_columns * saved.mesh_rows} points) at ${saved.mesh_speed_mm_s} mm/s · ${saved.mesh_samples} contacts per point · maximum spread ${saved.mesh_repeatability_mm} mm.` :
+  byId("probing-saved").textContent = saved ? `Saved: initial ${saved.first_speed_mm_s} mm/s · maximum Z search ${saved.max_descent_mm} mm · fine ${saved.second_speed_mm_s} mm/s · upward ${saved.lift_speed_mm_s} mm/s · ${saved.mesh_columns}×${saved.mesh_rows} mesh (${saved.mesh_columns * saved.mesh_rows} points) at ${saved.mesh_speed_mm_s} mm/s · ${saved.mesh_samples} contacts per point · maximum spread ${saved.mesh_repeatability_mm} mm · bed direction ${saved.mesh_yaw_deg}° from Base.` :
     "Reading the saved homing and mesh settings…";
 }
 
-function acceptProbingSettings(body, replaceInputs=false) {
+function acceptProbingSettings(body, replaceInputs=false, preserveInputs=false) {
   if (!body || typeof body.revision !== "string" || !body.settings || !validProbingSettings(body.settings)) {
     throw new Error("The saved homing settings are invalid or unavailable.");
   }
   const revisionChanged = probingSnapshot && probingSnapshot.revision !== body.revision;
-  if (replaceInputs || (!probingDirty && !probingConflict)) {
+  if (replaceInputs || (!preserveInputs && !probingDirty && !probingConflict)) {
     for (const [key, id] of Object.entries(probingInputs)) byId(id).value = body.settings[key];
     probingDirty = false; probingConflict = false; probingSnapshot = body;
   } else if (revisionChanged) {
@@ -1257,12 +1583,18 @@ async function refreshProbing(replaceInputs=false) {
   if (probingRefreshInFlight || probingSaveInFlight) return;
   probingRefreshInFlight = true;
   const version = probingRequestVersion;
+  const editVersion = probingEditVersion;
   updateProbingControls();
   try {
     const body = await request("/api/setup/probing");
     if (version !== probingRequestVersion) return;
-    acceptProbingSettings(body, replaceInputs);
-    if (replaceInputs) showMessage("probing-message", "Loaded the saved homing and mesh settings.");
+    // A manual reload may return after the operator starts another edit. Keep
+    // those newer inputs instead of snapping them back to the saved values.
+    const newerEdits = editVersion !== probingEditVersion;
+    const replaceCurrentInputs = replaceInputs && !newerEdits;
+    acceptProbingSettings(body, replaceCurrentInputs, newerEdits);
+    if (replaceInputs && !probingConflict) showMessage("probing-message", replaceCurrentInputs ?
+      "Loaded the saved homing and mesh settings." : "Saved settings checked; your newer edits were kept.");
   } catch (error) {
     if (version !== probingRequestVersion) return;
     probingAvailable = false;
@@ -1271,6 +1603,7 @@ async function refreshProbing(replaceInputs=false) {
 }
 
 for (const id of Object.values(probingInputs)) byId(id).addEventListener("input", () => {
+  probingEditVersion++;
   const values = probingValues();
   probingDirty = !probingSnapshot || Object.keys(probingInputs).some(key => values[key] !== probingSnapshot.settings[key]);
   updateSyncControls();
@@ -1321,7 +1654,7 @@ function updateBedGeometryControls() {
     bedSettingsConflict ? "Reload required" : bedSettingsDirty ? "Unsaved changes" : "Saved", bedSettingsConflict ? false : undefined);
   const saved = bedSettingsSnapshot;
   byId("bed-settings-saved").textContent = saved ? `Saved bed: ${saved.bed_size_mm.join(" × ")} mm · edge margin ${saved.probe_margin_mm} mm.` : "Reading saved bed dimensions…";
-  byId("bed-settings-area").textContent = valid ? `${bedSettingsDirty ? "Preview" : "Mesh area"}: X ${v.probe_margin_mm}–${v.width_mm-v.probe_margin_mm} mm, Y ${v.probe_margin_mm}–${v.depth_mm-v.probe_margin_mm} mm.` : "Enter dimensions and a margin that leave a positive probing area.";
+  byId("bed-settings-area").textContent = valid ? `${bedSettingsDirty ? "Preview" : "Mesh area"}: G-code X ${v.probe_margin_mm}–${v.width_mm-v.probe_margin_mm} mm, Y ${v.probe_margin_mm}–${v.depth_mm-v.probe_margin_mm} mm. First point relative to homed centre: X ${v.probe_margin_mm-v.width_mm/2}, Y ${v.probe_margin_mm-v.depth_mm/2} mm before bed-direction rotation.` : "Enter dimensions and a margin that leave a positive probing area.";
   byId("bed-settings-mesh").textContent = saved?.bed_mesh?.message || "";
 }
 

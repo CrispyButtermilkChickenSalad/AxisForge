@@ -1,6 +1,6 @@
 """Read ALPS bulk samples and detect bounded nozzle contact; no robot commands."""
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 import statistics
@@ -20,8 +20,9 @@ def finite(value):
 @dataclass(frozen=True)
 class ContactOptions:
     trigger_mode: str = 'grams'
+    trigger_source: str = 'stream'
     contact_delta_counts: float = 20000.
-    max_delta_counts: float = 60000.
+    max_delta_counts: float = 120000.
     contact_force_g: float = 50.
     max_force_g: float = 200.
     step_mm: float = .02
@@ -35,12 +36,17 @@ class ContactOptions:
     max_sample_age_s: float = .3
     max_nozzle_temp_c: float = 50.
     consecutive_samples: int = 5
+    baseline_noise_fraction: float = .25
 
     def __post_init__(self):
         if self.trigger_mode not in ('grams', 'raw'):
             raise ValueError('trigger_mode must be grams or raw')
+        if self.trigger_source not in ('stream', 'klipper_probe'):
+            raise ValueError('trigger_source must be stream or klipper_probe')
+        if self.trigger_source == 'klipper_probe' and self.trigger_mode != 'raw':
+            raise ValueError('klipper_probe requires raw guard units to preserve the ADC overload limit')
         for name, value in vars(self).items():
-            if name == 'trigger_mode': continue
+            if name in ('trigger_mode', 'trigger_source'): continue
             if not finite(value): raise ValueError(name+' must be finite')
             if name != 'contact_offset_mm' and value <= 0:
                 raise ValueError(name+' must be positive')
@@ -54,12 +60,17 @@ class ContactOptions:
             raise ValueError('Contact steps must be 0.001..0.05 mm and speed at most 0.5 mm/s')
         if self.retract_mm < 5*self.step_mm:
             raise ValueError('retract_mm must be at least five contact steps')
-        if type(self.samples) is not int or not 2 <= self.samples <= 5:
-            raise ValueError('samples must be an integer from 2 to 5')
+        if type(self.samples) is not int or not 1 <= self.samples <= 5:
+            raise ValueError('samples must be an integer from 1 to 5')
         if type(self.consecutive_samples) is not int or not 2 <= self.consecutive_samples <= 50:
             raise ValueError('consecutive_samples must be an integer from 2 to 50')
         if not .1 <= self.max_sample_age_s <= .5:
             raise ValueError('max_sample_age_s must be 0.1..0.5 s')
+        if not .25 <= self.baseline_noise_fraction <= .4:
+            raise ValueError('baseline_noise_fraction must be 0.25..0.4 of the contact threshold')
+
+    @property
+    def baseline_noise_limit(self): return self.threshold*self.baseline_noise_fraction
 
     @property
     def threshold(self):
@@ -85,6 +96,27 @@ class ContactDetected(RuntimeError):
     """A normal contact event: cancel the current tiny step and measure at rest."""
 
 
+class ContactMeasurementRejected(RuntimeError):
+    """Contact was stopped but its position/load measurement cannot be accepted."""
+
+
+class LoadCellOverload(RuntimeError):
+    """A measured load-limit event, distinct from sensor or motion failures."""
+    def __init__(self, load, maximum, unit):
+        self.load, self.maximum, self.unit = load, maximum, unit
+        super().__init__('Load-cell overload: %.1f %s exceeds %.1f %s' %
+                         (load, unit, maximum, unit))
+
+
+def thermal_contact_options(options, *, hot_nozzle):
+    """Allow a bounded extra unloaded noise span only for explicit hot sessions.
+
+    This changes neither contact detection nor any single-sample overload,
+    reference-load, release-load, timing or ADC-headroom guard.
+    """
+    return replace(options,baseline_noise_fraction=.4 if hot_nozzle else .25)
+
+
 class ContactDetector:
     def __init__(self, baseline, counts_per_gram, options):
         if not finite(baseline): raise ValueError('A finite unloaded baseline is required')
@@ -106,8 +138,7 @@ class ContactDetector:
             load = abs(self.load(sample.counts))
             self.peak_load = max(self.peak_load, load)
             if load >= self.options.maximum:
-                raise RuntimeError('Load-cell overload: %.1f %s exceeds %.1f %s' %
-                                   (load,self.options.unit,self.options.maximum,self.options.unit))
+                raise LoadCellOverload(load, self.options.maximum, self.options.unit)
             self.consecutive = self.consecutive+1 if load >= self.options.threshold else 0
             if self.consecutive >= self.options.consecutive_samples: self.triggered = True
         return self.triggered
@@ -123,20 +154,33 @@ def stable_baseline(samples, sensor, options, reference_counts=None):
     if options.trigger_mode == 'raw' and (
             min(counts)-ADC_MIN_COUNTS <= options.maximum or ADC_MAX_COUNTS-max(counts) <= options.maximum):
         raise ValueError('ALPS ADC is saturated or has insufficient raw-count headroom')
-    if (max(counts)-min(counts))/scale > options.threshold*.25:
-        raise ValueError('Load cell is too noisy or still moving; baseline rejected')
+    noise=(max(counts)-min(counts))/scale
+    if noise > options.baseline_noise_limit:
+        raise ValueError('Load cell is too noisy or still moving; baseline rejected: '
+                         'sample range %.1f %s exceeds %.1f %s' %
+                         (noise,options.unit,options.baseline_noise_limit,options.unit))
+    if options.baseline_noise_fraction > .25:
+        # Wider symmetric hot noise must still fit the unchanged unloaded-load
+        # guard. Do not mistake thermal drift, applied load or an isolated peak
+        # for an acceptable stationary noise envelope.
+        if max(abs(value-baseline) for value in counts)/scale >= options.threshold*.25:
+            raise ValueError('Heated ALPS noise is too asymmetric; baseline rejected')
+        half=len(counts)//2
+        drift=abs(statistics.median(counts[:half])-statistics.median(counts[-half:]))/scale
+        if drift > options.threshold*.125:
+            raise ValueError('Heated ALPS baseline is drifting; wait for the load cell to stabilize')
     if reference_counts is not None and abs(baseline-reference_counts)/scale >= options.threshold:
         raise ValueError('Nozzle may already be loaded at hover; unload/check calibration before probing')
     return baseline
 
 
-def validate_printer(status, cell, options, require_calibration=True):
+def validate_printer(status, cell, options, require_calibration=True, *, check_temperature=True):
     """False is read-only sensor diagnosis; raw motion still passes True here."""
     sensor = status.get(cell,{})
     if not sensor: raise RuntimeError('Klipper load-cell object not found: '+cell)
     if status.get('webhooks',{}).get('state') != 'ready':
         raise RuntimeError('Klipper is not ready')
-    if require_calibration and options.trigger_mode == 'grams' and (sensor.get('is_calibrated') is not True or
+    if require_calibration and (options.trigger_mode == 'grams' or options.trigger_source == 'klipper_probe') and (sensor.get('is_calibrated') is not True or
             not finite(sensor.get('counts_per_gram')) or sensor['counts_per_gram'] <= 0 or
             not finite(sensor.get('reference_tare_counts'))):
         raise RuntimeError('ALPS is not calibrated: run LOAD_CELL_CALIBRATE LOAD_CELL='+cell+
@@ -148,7 +192,7 @@ def validate_printer(status, cell, options, require_calibration=True):
         raise RuntimeError('A synchronized job owns Klipper')
     if status.get('virtual_sdcard',{}).get('is_active') or status.get('print_stats',{}).get('state') in ('printing','paused'):
         raise RuntimeError('Klipper has an active or paused print')
-    if require_calibration:
+    if require_calibration and check_temperature:
         for name in ('extruder','heater_bed'):
             heater = status.get(name,{})
             if heater.get('target',0) != 0: raise RuntimeError('Turn heater targets off before bed probing')
@@ -165,7 +209,8 @@ class AlpsStream:
     started, errors are latched; reconnection requires a new probing session.
     """
     def __init__(self, moonraker_url, alps_url=None, cell='load_cell_probe', api_key=None,
-                 options=None, require_calibration=True, clock=time.monotonic):
+                 options=None, require_calibration=True, clock=time.monotonic,
+                 status_validator=None):
         self.options = options or ContactOptions()
         parts = urlsplit(moonraker_url)
         if parts.scheme not in ('http','https') or not parts.hostname or parts.username or parts.password:
@@ -180,6 +225,7 @@ class AlpsStream:
         self.moonraker_url, self.alps_url = moonraker_url.rstrip('/'), alps_url.rstrip('/')
         self.cell, self.api_key, self.clock = cell, api_key, clock
         self.require_calibration = require_calibration
+        self.status_validator = status_validator or validate_printer
         self.lock = threading.Lock()
         self.samples = deque(maxlen=6000)
         self.error = None
@@ -198,9 +244,9 @@ class AlpsStream:
         headers = {'X-Api-Key':self.api_key} if self.api_key else {}
         with urlopen(Request(self.moonraker_url+'/printer/objects/query?'+query,headers=headers),timeout=.75) as response:
             status = json.load(response)['result']['status']
-        sensor = validate_printer(status,self.cell,self.options,self.require_calibration)
+        sensor = self.status_validator(status,self.cell,self.options,self.require_calibration)
         with self.lock:
-            if self.sensor is not None and self.require_calibration and self.options.trigger_mode == 'grams':
+            if self.sensor is not None and self.require_calibration and (self.options.trigger_mode == 'grams' or self.options.trigger_source == 'klipper_probe'):
                 if any(sensor.get(k)!=self.sensor.get(k) for k in ('counts_per_gram','reference_tare_counts')):
                     raise RuntimeError('Load-cell calibration changed during probing')
             self.sensor, self.health_at = dict(sensor), self.clock()
@@ -255,14 +301,24 @@ class AlpsStream:
         with self.lock:
             if self.min_offset is not None and (offset-self.min_offset > self.options.max_sample_age_s or offset<self.min_offset-.1):
                 raise RuntimeError('ALPS delivery stalled or source clock changed')
-            self.min_offset = offset if self.min_offset is None else min(self.min_offset,offset)
+            mapped_offset = offset if self.min_offset is None else min(self.min_offset,offset)
+            if self.min_offset is not None and mapped_offset < self.min_offset:
+                # Use one clock mapping for the entire retained interval. The
+                # old per-batch arrival anchor could reverse sample times when
+                # network delivery caught up. A better (earlier) offset rebases
+                # all buffered samples conservatively; it never makes them newer.
+                self.samples = deque((ForceSample(s.sequence,
+                    min(s.observed_at, s.source_time+mapped_offset), s.source_time, s.counts)
+                    for s in self.samples), maxlen=self.samples.maxlen)
+            self.min_offset = mapped_offset
             for stamp,counts,*_ in rows:
                 if self.last_source is not None and stamp <= self.last_source:
                     raise RuntimeError('ALPS sample timestamps repeated or moved backwards')
                 if self.last_source is not None and stamp-self.last_source > .05:
                     raise RuntimeError('ALPS samples have a gap greater than 50 ms')
                 self.sequence += 1
-                self.samples.append(ForceSample(self.sequence,min(now,now+stamp-source_now),stamp,float(counts)))
+                self.samples.append(ForceSample(self.sequence,
+                    min(now,stamp+self.min_offset),stamp,float(counts)))
                 self.last_source = stamp
             self.received_at = now
 
@@ -273,7 +329,10 @@ class AlpsStream:
             if self.health_at is None or now-self.health_at > 1.:
                 raise RuntimeError('Klipper sensor/idle status is stale')
             if self.received_at is None or now-self.received_at > self.options.max_sample_age_s:
-                raise RuntimeError('ALPS load-cell samples are stale or missing')
+                age = 'missing' if self.received_at is None else '%.3f s' % (now-self.received_at)
+                raise RuntimeError('ALPS load-cell samples are stale or missing '
+                                   '(last batch age %s; limit %.3f s)' %
+                                   (age, self.options.max_sample_age_s))
             recent = [s for s in self.samples if s.observed_at >= now-1.1]
             if len(recent) >= 20 and recent[-1].observed_at-recent[0].observed_at >= 1.:
                 if all(s.counts == recent[0].counts for s in recent):
@@ -301,7 +360,9 @@ class AlpsStream:
 
 
 def repeat_contact(readings, tolerance):
-    if len(readings)<2: raise ValueError('Repeated contact measurements are required')
+    if not readings: raise ValueError('At least one contact measurement is required')
+    if len(readings) == 1:
+        return readings[0], None  # Repeatability cannot be measured from one contact.
     heights = [float(r['nozzle'][2]) for r in readings]
     spread = max(heights)-min(heights)
     if spread > tolerance:

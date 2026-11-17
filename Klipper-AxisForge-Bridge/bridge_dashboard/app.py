@@ -72,9 +72,23 @@ class StartJobRequest(BaseModel):
     clock_options: ClockOptions | None = None
 
 
+class ProbeThermalRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    nozzle_target_c: float = Field(ge=0.,le=300.,allow_inf_nan=False)
+    bed_target_c: float = Field(ge=0.,le=150.,allow_inf_nan=False)
+    soak_s: float = Field(default=60.,ge=5.,le=1800.,allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def heater_range(self):
+        if 0<self.nozzle_target_c<50 or 0<self.bed_target_c<30:
+            raise ValueError('Use 0 for off, nozzle targets at least 50 C and bed targets at least 30 C')
+        return self
+
+
 class BedProbeStartRequest(BaseModel):
     model_config = ConfigDict(extra='forbid')
     dry_run: StrictBool = False
+    thermal: ProbeThermalRequest | None = None
 
 
 class BedProbeConfirmation(BaseModel):
@@ -87,9 +101,16 @@ class LoadCalibrationConfirmation(BedProbeConfirmation):
     stage: Literal['home', 'scale', 'tare']
 
 
-class LoadCalibrationAction(BaseModel):
+class LoadCalibrationStartRequest(BaseModel):
     model_config = ConfigDict(extra='forbid', strict=True)
-    command: Literal['step', 'finish']
+    dry_run: StrictBool = False
+    calibration_max_counts: float = Field(default=120000., ge=90000., le=250000., allow_inf_nan=False)
+    calibration_hot_target: float | None = Field(default=None, ge=50., le=300., allow_inf_nan=False)
+
+
+class BedProbeAction(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    command: Literal['step', 'continue', 'finish_recovery']
     token: str = Field(min_length=16, max_length=128)
     delta_mm: float | None = Field(default=None, ge=-10., le=10., allow_inf_nan=False)
 
@@ -97,8 +118,21 @@ class LoadCalibrationAction(BaseModel):
     def supported_step(self):
         if self.command == 'step' and (self.delta_mm is None or abs(self.delta_mm) not in (.001, .01, .05, .1, .5, 1., 10.)):
             raise ValueError('Choose a supported Z step size')
-        if self.command == 'finish' and self.delta_mm is not None:
-            raise ValueError('Finish does not accept a movement distance')
+        if self.command != 'step' and self.delta_mm is not None:
+            raise ValueError('Only a step accepts a movement distance')
+        return self
+
+
+class LoadCalibrationAction(BedProbeAction):
+    command: Literal['step', 'record', 'finish', 'continue', 'finish_recovery']
+    grams: float | None = Field(default=None, ge=50., le=25000., allow_inf_nan=False)
+
+    @model_validator(mode='after')
+    def measured_weight(self):
+        if self.command == 'record' and self.grams is None:
+            raise ValueError('Enter the measured scale reading in grams')
+        if self.command != 'record' and self.grams is not None:
+            raise ValueError('Only record accepts a scale reading')
         return self
 
 
@@ -115,10 +149,12 @@ class ProbingValues(BaseModel):
     first_speed_mm_s: float = Field(ge=.5, le=10., allow_inf_nan=False)
     second_speed_mm_s: float = Field(ge=.02, le=1., allow_inf_nan=False)
     lift_speed_mm_s: float = Field(ge=1., le=20., allow_inf_nan=False)
+    max_descent_mm: float = Field(ge=5., le=350., allow_inf_nan=False)
     mesh_columns: int = Field(ge=2, le=9)
     mesh_rows: int = Field(ge=2, le=9)
-    mesh_speed_mm_s: float = Field(ge=.02, le=.2, allow_inf_nan=False)
-    mesh_samples: int = Field(ge=3, le=5)
+    mesh_yaw_deg: float = Field(ge=-180, le=180, allow_inf_nan=False)
+    mesh_speed_mm_s: float = Field(ge=.02, le=.5, allow_inf_nan=False)
+    mesh_samples: int = Field(ge=1, le=5)
     mesh_repeatability_mm: float = Field(ge=.005, le=.05, allow_inf_nan=False)
 
     @model_validator(mode='after')
@@ -178,6 +214,7 @@ def create_app(settings=None):
         app.state.probing_settings = ProbingSettings(settings.axisforge_config)
         app.state.bed_settings = BedSettings(settings.axisforge_config)
         try:
+            app.state.workflow.master.start_clock_monitor()
             await app.state.rosbridge.start()
             yield
         finally:
@@ -294,11 +331,11 @@ def create_app(settings=None):
     async def load_calibration_status(): return app.state.load_calibration.status()
 
     @app.post('/api/load-calibration/start')
-    async def start_load_calibration(request: BedProbeStartRequest | None = None):
+    async def start_load_calibration(request: LoadCalibrationStartRequest | None = None):
         async with operation_lock:
             await require_probe_idle()
             require_jobs_idle()
-            try: return await app.state.load_calibration.start(dry_run=(request or BedProbeStartRequest()).dry_run)
+            try: return await app.state.load_calibration.start(**(request or LoadCalibrationStartRequest()).model_dump())
             except BedProbeError as error: raise HTTPException(409,str(error)) from error
 
     @app.post('/api/load-calibration/confirm')
@@ -306,10 +343,22 @@ def create_app(settings=None):
         try: return await app.state.load_calibration.confirm(request.stage,request.token)
         except BedProbeError as error: raise HTTPException(409,str(error)) from error
 
+    @app.post('/api/load-calibration/clear-session')
+    async def clear_load_calibration_session():
+        async with operation_lock:
+            await require_probe_idle()
+            require_jobs_idle()
+            try: return await app.state.load_calibration.clear_session()
+            except BedProbeError as error: raise HTTPException(409,str(error)) from error
+
     @app.post('/api/load-calibration/action')
     async def load_calibration_action(request: LoadCalibrationAction):
-        try: return await app.state.load_calibration.action(request.command,request.token,request.delta_mm)
-        except BedProbeError as error: raise HTTPException(409,str(error)) from error
+        async with operation_lock:
+            require_jobs_idle()
+            if app.state.bed_probe.busy():
+                raise HTTPException(409, 'Bed homing/probing owns the robot')
+            try: return await app.state.load_calibration.action(request.command,request.token,request.delta_mm,request.grams)
+            except BedProbeError as error: raise HTTPException(409,str(error)) from error
 
     @app.post('/api/load-calibration/abort')
     async def abort_load_calibration():
@@ -330,7 +379,9 @@ def create_app(settings=None):
             if standalone.get('running') or standalone.get('planning_check_running'):
                 raise HTTPException(status_code=409, detail='Wait for the standalone AxisForge operation to finish')
             try:
-                return await app.state.bed_probe.start(dry_run=(request or BedProbeStartRequest()).dry_run)
+                options=request or BedProbeStartRequest()
+                return await app.state.bed_probe.start(dry_run=options.dry_run,
+                    **({'thermal':options.thermal.model_dump()} if options.thermal is not None else {}))
             except BedProbeError as error:
                 raise HTTPException(status_code=409, detail=str(error)) from error
 
@@ -347,6 +398,15 @@ def create_app(settings=None):
             return await app.state.bed_probe.abort()
         except BedProbeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @app.post('/api/bed-probe/action')
+    async def bed_probe_action(request: BedProbeAction):
+        async with operation_lock:
+            require_jobs_idle()
+            if app.state.load_calibration.busy():
+                raise HTTPException(409, 'ALPS calibration owns the robot')
+            try: return await app.state.bed_probe.action(request.command, request.token, request.delta_mm)
+            except BedProbeError as error: raise HTTPException(409, str(error)) from error
 
     @app.get("/")
     async def index():

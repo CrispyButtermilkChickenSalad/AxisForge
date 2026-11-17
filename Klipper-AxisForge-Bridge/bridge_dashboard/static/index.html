@@ -37,7 +37,7 @@
         <p class="chart-caption">Power, brakes, mode selection, and program Load/Play are manual actions. Connect robot only launches the configured PC driver and checks feedback.</p>
         <p id="robot-configuration" class="chart-caption"></p>
         <p id="robot-orientation" class="chart-caption"></p>
-        <p class="chart-caption">Zero G-code A/B/C uses AxisForge’s saved orientation in the robot Base frame. It does not mean zero robot joint angles or zero values in the pendant’s TCP fields. Use the pendant to place the upright nozzle initially; homing checks that pose and preserves its orientation.</p>
+        <p class="chart-caption">Zero G-code A/B/C uses AxisForge’s saved orientation in the robot Base frame. It does not mean zero robot joint angles or zero values in the pendant’s TCP fields. Homing can correct a starting tilt of up to 0.5° after surface confirmation, without changing your saved Home waypoint.</p>
         <ul id="robot-readiness" class="startup-checks"></ul>
       </section>
       <section class="card" aria-label="AxisForge nozzle TCP settings">
@@ -59,32 +59,15 @@
         <p id="tcp-message" class="inline-message" role="status"></p>
         <p id="tcp-bed-mesh" class="chart-caption" role="status"></p>
       </section>
-      <section class="card" aria-label="ALPS weighing scale calibration">
-        <div class="card-heading"><h2>2. ALPS load calibration</h2><span id="load-calibration-badge" class="badge">Not run</span></div>
-        <p class="muted">Use the teaching pendant for the initial home pose, XY placement and orientation. Place a weighing scale on the buildplate beneath the upright nozzle. After confirmation, the arm finds contact slowly, lifts 5 mm, and waits for you to tare the scale. The Z buttons below become available after taring.</p>
-        <div class="button-row"><button id="load-calibration-start" class="button primary" disabled>Start scale routine</button><button id="load-calibration-simulate" class="button secondary" disabled>Simulate scale routine</button><button id="load-calibration-abort" class="button danger" disabled>Stop calibration</button></div>
-        <p id="load-calibration-readiness" class="chart-caption"></p>
-        <p id="load-calibration-message" class="inline-message" role="status"></p>
-        <p id="load-calibration-sensor" class="chart-caption"></p>
-        <div id="load-calibration-confirmation" class="probe-confirmation" hidden><h3 id="load-calibration-confirm-title"></h3><p id="load-calibration-confirm-detail"></p><button id="load-calibration-confirm" class="button primary" disabled>Confirm</button></div>
-        <div id="load-calibration-steps" class="probe-confirmation" hidden>
-          <h3>Adjust the load with Z baby steps</h3>
-          <label for="load-step-size">Distance per click</label>
-          <select id="load-step-size"><option value="10">10 mm</option><option value="1">1 mm</option><option value="0.5">0.5 mm</option><option value="0.1">0.1 mm</option><option value="0.05">0.05 mm</option><option value="0.01" selected>0.01 mm</option><option value="0.001">0.001 mm</option></select>
-          <div class="button-row"><button id="load-step-up" class="button secondary" disabled>↑ Up — release load</button><button id="load-step-down" class="button secondary" disabled>↓ Down — apply load</button><button id="load-calibration-finish" class="button primary" disabled>Finish — scale unloaded</button></div>
-          <p id="load-calibration-position" class="chart-caption"></p>
-          <p id="load-step-guidance" class="chart-caption" role="status"></p>
-          <p>Use a small stable load shown on the scale as your first weight. Open ALPS Logger → Calibration and log that measured weight with its sensor reading. Adjust to a second distinct stable load and log it there too. Do not assume a target weight from uncalibrated counts.</p>
-          <p class="chart-caption">One click makes one Z move in the robot Base frame, with XY and orientation held. Travel is limited to 25 mm above detected contact and 0.25 mm below it. Down steps larger than 0.05 mm must finish at least 0.5 mm above contact; use 0.05 mm or finer to apply load. Use Up to unload before finishing. An overload or lost feedback stops the routine.</p>
-        </div>
-        <button id="calibration-open-logger" class="button secondary" type="button">Open ALPS Logger tab</button>
-      </section>
       <section class="card bed-probe-card" aria-label="Bed homing and load-cell mesh">
         <div class="card-heading">
-          <h2>3. Home &amp; probe bed</h2>
+          <h2>2. Home &amp; probe bed</h2>
           <span id="bed-probe-badge" class="badge">Checking…</span>
         </div>
-        <p class="muted">Place the flat build surface beneath the upright nozzle. After confirmation, a continuous Z search finds its approximate height, then two slower contacts refine the height. Defaults are 10 mm/s for the initial search and 0.2 mm/s for the fine contacts. The arm then moves above the first mesh point and waits for your confirmation before measuring the mesh.</p>
+        <p class="muted">Place the flat build surface beneath the nozzle. Confirm the nozzle is clear and unloaded, with room around the toolhead. If needed, the cycle first aligns upright by up to 0.5° around the nozzle tip over at least 3 seconds. Then adjust height with the Z controls below and choose Continue to start the search. A continuous Z search finds the approximate height, then a 3 mm upward backoff releases contact before one slower contact refines it. Set the search and contact speeds below. Mesh travel clears the highest measured surface by 3 mm. Each mesh point uses a 0.1 mm near-contact search that stops on load, followed by 0.01 mm precision passes for the saved height. The arm waits for front-left mesh confirmation before measuring the grid and returns to the corrected starting pose afterward.</p>
+        <p id="bed-probe-alignment" class="chart-caption"></p>
+        <p class="chart-caption">Once both homing contacts establish Home, a mesh failure automatically releases contact upward, lifts clear and returns there. The failed scan does not replace the previous valid mesh. Stop probing cancels all movement; lost feedback, unsafe load or an unconfirmed stop blocks automatic return.</p>
+        <p id="bed-probe-home-recovery" class="chart-caption" role="status"></p>
         <form id="bed-settings-form">
           <div class="card-heading"><h3>Build surface</h3><span id="bed-settings-badge" class="badge">Loading…</span></div>
           <fieldset id="bed-settings-fields" class="probing-fields" disabled>
@@ -97,7 +80,7 @@
           </fieldset>
           <p id="bed-settings-saved" class="chart-caption"></p>
           <p id="bed-settings-area" class="chart-caption"></p>
-          <p class="chart-caption">G-code X/Y must stay between zero and the bed width/depth, including purge lines and end-of-print parking. Resizing preserves the calibrated physical front-left corner. The selected grid fits inside the edge margin. Save, re-probe, then repeat job preflight; a mesh for a different bed size is rejected.</p>
+          <p class="chart-caption">G-code X/Y must stay between zero and the bed width/depth, including purge lines and end-of-print parking. The next mesh is centred on the homing position and fits inside the edge margin. Save, re-probe, then repeat job preflight; a mesh for a different bed size is rejected.</p>
           <p id="bed-settings-mesh" class="inline-message"></p>
           <div class="button-row"><button id="bed-settings-save" class="button primary" type="submit" disabled>Save bed dimensions</button><button id="bed-settings-reload" class="button secondary" type="button" disabled>Reload saved dimensions</button></div>
           <p id="bed-settings-message" class="inline-message" role="status"></p>
@@ -107,22 +90,42 @@
           <fieldset id="probing-fields" class="probing-fields" disabled>
             <legend>Saved settings for the next routine</legend>
             <div class="probing-grid">
-              <label for="probing-search-speed">Initial search (mm/s)<input id="probing-search-speed" type="number" step="any" min="0.5" max="10" required></label>
+              <label for="probing-search-speed">Initial search (mm/s)<input id="probing-search-speed" type="number" step="any" min="0.5" max="10" aria-describedby="probing-speed-guidance" required></label>
+              <label for="probing-search-limit">Maximum Z search (mm)<input id="probing-search-limit" type="number" step="any" min="5" max="350" aria-describedby="probing-search-guidance" required></label>
               <label for="probing-fine-speed">Fine rehoming (mm/s)<input id="probing-fine-speed" type="number" step="any" min="0.02" max="1" required></label>
               <label for="probing-lift-speed">Upward lifts / retractions (mm/s)<input id="probing-lift-speed" type="number" step="any" min="1" max="20" required></label>
               <label for="probing-mesh-columns">Mesh points along X<input id="probing-mesh-columns" type="number" step="1" min="2" max="9" required></label>
               <label for="probing-mesh-rows">Mesh points along Y<input id="probing-mesh-rows" type="number" step="1" min="2" max="9" required></label>
-              <label for="probing-mesh-speed">Mesh contact (mm/s)<input id="probing-mesh-speed" type="number" step="any" min="0.02" max="0.2" required></label>
-              <label for="probing-mesh-samples">Contacts per mesh point<input id="probing-mesh-samples" type="number" step="1" min="3" max="5" required></label>
+              <label for="probing-mesh-yaw">Bed direction in Base XY (degrees)<input id="probing-mesh-yaw" type="number" step="any" min="-180" max="180" required></label>
+              <label for="probing-mesh-speed">Mesh contact (mm/s)<input id="probing-mesh-speed" type="number" step="any" min="0.02" max="0.5" required></label>
+              <label for="probing-mesh-samples">Contacts per mesh point<input id="probing-mesh-samples" type="number" step="1" min="1" max="5" required></label>
               <label for="probing-repeatability">Maximum Z spread (mm)<input id="probing-repeatability" type="number" step="any" min="0.005" max="0.05" required></label>
             </div>
           </fieldset>
+          <p id="probing-speed-guidance" class="chart-caption" role="status">Initial search: 0.5–10 mm/s; 5 mm/s is the default, not the minimum. Fine rehoming must be slower. Click Save homing settings to apply changes to the next run.</p>
           <p id="probing-saved" class="chart-caption"></p>
-          <p class="chart-caption">Slower contacts and repeated measurements improve repeatability; a tighter accepted spread rejects inconsistent readings. Maximum Z spread applies to the two fine homing contacts and to each mesh point. Mesh defaults use 0.1 mm/s, five contacts and a 0.02 mm maximum spread. These settings can be saved with the equipment offline. Saving clears job preflight and applies to the next routine.</p>
+          <p class="chart-caption">Start homing above the bed centre. That nozzle X/Y position becomes the centre of the new mesh. At 0°, bed +X/+Y follow robot Base +X/+Y, so front-left is in negative X and Y. Rotate the bed direction if your viewing position differs; this rotates the grid, not the nozzle. The first point is half the bed width/depth minus the edge margin from centre. The completed mesh carries this same placement into print preflight and execution.</p>
+          <p id="probing-search-guidance" class="chart-caption">Maximum Z search is measured downward from the nozzle’s current starting position, which may differ from home. Estimate the current nozzle-to-bed gap and add 50 mm, within the allowed path. Default: 350 mm; adjustable from 5–350 mm. The entire possible search path is checked before motion, even though contact stops descent early. If an earlier attempt already lowered the arm, reduce this range before starting again. Reaching the limit without contact stops the routine; review the travel area before confirming homing.</p>
+          <p class="chart-caption">Before each live setup move, the bridge checks samples along the full requested path against the UR controller’s active safety limits. A rejected sample or unavailable query blocks movement. This supplements the controller’s safety system; it is not continuous collision checking. Maximum Z search is measured from the adjusted starting pose; the robot’s safety planes can impose a shorter range.</p>
+          <p class="chart-caption">Slower contacts and repeated measurements improve repeatability; a tighter accepted spread rejects inconsistent readings. Initial homing uses one quick and one fine contact. Choose 1–5 contacts per mesh point; maximum Z spread applies when a point has at least two contacts. One contact cannot measure repeatability. Mesh contact speed is adjustable from 0.02–0.5 mm/s; maximum Z spread from 0.005–0.05 mm. The saved values are shown above. These settings can be saved with the equipment offline. Saving clears job preflight and applies to the next routine.</p>
           <div class="button-row"><button id="probing-save" class="button primary" type="submit" disabled>Save homing settings</button><button id="probing-reload" class="button secondary" type="button" disabled>Reload saved settings</button></div>
           <p id="probing-message" class="inline-message" role="status"></p>
         </form>
-        <p class="chart-caption">Choose 2–9 points along each axis (4–81 points total); the default is 3×3. The probe area and front-left starting corner stay fixed. Upward lifts and retractions default to 20 mm/s; XY travel uses AxisForge’s configured travel speed. Acceleration and joint limits still apply. After measuring the selected grid, the arm returns to its starting nozzle position. Run this whenever the bed moves. Starting clears saved job preflight.</p>
+        <p class="chart-caption">Choose 2–9 points along each axis (4–81 points total); the default is 3×3. The grid is centred on the homing start and fits within the saved bed dimensions and edge margin. Upward lifts and retractions default to 10 mm/s; XY travel uses AxisForge’s configured travel speed. Repeated contacts search only near the first measured height, reducing the checks between passes. After measuring the grid, the arm returns to its starting nozzle position. Run this whenever the bed moves. Starting clears saved job preflight.</p>
+        <fieldset id="probe-thermal-fields" class="probing-fields">
+          <legend>Temperature for the next mesh</legend>
+          <label class="check-row" for="probe-heated"><input id="probe-heated" type="checkbox"><span>Probe at printing temperatures</span></label>
+          <div id="probe-thermal-inputs" class="probing-grid" hidden>
+            <label for="probe-nozzle-target">Nozzle target (°C; 0 = off)<input id="probe-nozzle-target" type="number" min="0" max="300" step="any" value="210"></label>
+            <label for="probe-bed-target">Bed target (°C; 0 = off)<input id="probe-bed-target" type="number" min="0" max="150" step="any" value="0"></label>
+            <label for="probe-soak">Stable-temperature soak (seconds)<input id="probe-soak" type="number" min="5" max="1800" step="1" value="60"></label>
+          </div>
+          <button id="probe-copy-temperatures" class="button secondary" type="button">Use current Klipper targets</button>
+          <p class="chart-caption">Cold probing requires heaters off and the nozzle below 50°C. For heated probing, set matching targets in Fluidd/Mainsail first. The routine waits within ±2°C for the selected soak, then takes a fresh unloaded ALPS baseline. Use a clean nozzle and a surface suitable for the selected temperature. Heater targets remain under Klipper control after completion or Stop.</p>
+          <p class="chart-caption">A heated nozzle allows a wider unloaded ALPS noise range: 8,000 counts with the default trigger, compared with 5,000 cold. Drift, unloaded-load, contact and overload checks still apply; a short soak may need more time for the sensor to settle.</p>
+          <p id="probe-thermal-status" class="chart-caption" role="status"></p>
+        </fieldset>
+        <p id="bed-probe-saved-mesh" class="chart-caption" role="status"></p>
         <div class="button-row">
           <button id="bed-probe-start" class="button primary" type="button" disabled>Home &amp; probe bed</button>
           <button id="bed-probe-simulate" class="button secondary" type="button" disabled>Simulate routine</button>
@@ -130,6 +133,12 @@
         </div>
         <p id="bed-probe-readiness" class="chart-caption"></p>
         <p id="bed-probe-message" class="inline-message" role="status">Checking the homing service…</p>
+        <div id="bed-probe-recovery" class="probe-confirmation" hidden>
+          <button id="bed-probe-retry" class="button primary" type="button" disabled>Retry homing</button>
+          <p id="bed-probe-retry-guidance" class="chart-caption">Correct the reported fault and leave the nozzle clear of the surface and unloaded. Review the maximum Z search for the current position. Retry starts fresh checks and asks for surface confirmation again; it does not lift the arm or resume the interrupted movement.</p>
+          <p id="bed-probe-retry-status" class="chart-caption" role="status"></p>
+        </div>
+        <p id="bed-probe-last-error" class="chart-caption" hidden></p>
         <p id="bed-probe-sensor" class="chart-caption"></p>
         <div id="bed-probe-progress-container" class="preflight-progress" hidden>
           <label for="bed-probe-progress" id="bed-probe-progress-label">Bed probe progress</label>
@@ -141,8 +150,89 @@
           <p id="bed-probe-position" class="chart-caption"></p>
           <button id="bed-probe-confirm" class="button primary" type="button" disabled>Confirm</button>
         </div>
+        <div id="bed-z-controls" class="probe-confirmation">
+          <h3>Move nozzle in Z / lift clear</h3>
+          <p class="chart-caption">After unloaded surface confirmation, use one step at a time to position the nozzle before homing. Every downward positioning step stops on contact. After a recoverable contact failure, the same session offers upward release without resetting the ALPS baseline. XY and orientation stay fixed.</p>
+          <p id="bed-z-status" class="inline-message" role="status">Start homing and confirm the unloaded surface to enable Z positioning.</p>
+          <div class="calibration-z-grid" aria-label="Homing Z baby steps">
+            <button class="button secondary" data-bed-z-step="10" disabled>↑ Up 10 mm</button>
+            <button class="button secondary" data-bed-z-step="1" disabled>↑ Up 1 mm</button>
+            <button class="button secondary" data-bed-z-step="0.1" disabled>↑ Up 0.1 mm</button>
+            <button class="button secondary" data-bed-z-step="0.05" disabled>↑ Up 0.05 mm</button>
+            <button class="button secondary" data-bed-z-step="-10" disabled>↓ Down 10 mm</button>
+            <button class="button secondary" data-bed-z-step="-1" disabled>↓ Down 1 mm</button>
+            <button class="button secondary" data-bed-z-step="-0.1" disabled>↓ Down 0.1 mm</button>
+            <button class="button secondary" data-bed-z-step="-0.05" disabled>↓ Down 0.05 mm</button>
+          </div>
+          <p id="bed-z-position" class="chart-caption"></p>
+          <div class="button-row"><button id="bed-z-continue" class="button primary" disabled hidden>Continue — start Z homing</button><button id="bed-z-finish" class="button secondary" disabled hidden>Finish recovery</button></div>
+          <p class="chart-caption">While loaded, use Up 0.1 mm or finer. Larger Up steps become available when fresh readings show the nozzle is unloaded. If load rises during an Up step, that step stops and recovery stays open. Further steps wait for a fresh window below the original release ceiling; no step repeats automatically. Finish recovery ends this attempt; Retry homing starts fresh checks and confirmations. Sensor faults, lost control or an unconfirmed stop require manual recovery.</p>
+        </div>
       </section>
 
+      <section class="card" aria-label="ALPS weighing scale calibration">
+        <div class="card-heading"><h2>3. ALPS load calibration</h2><span id="load-calibration-badge" class="badge">Not run</span></div>
+        <p class="muted">This routine prepares the scale for supervised ALPS calibration. It does not home the bed or read the weighing scale automatically.</p>
+        <ol id="load-calibration-overview">
+          <li><strong>Position the nozzle:</strong> use your existing arm controls for XY placement and upright orientation. Confirm the current start pose and an unloaded nozzle above the scale, then use the dashboard Z buttons to leave a gap of at most 20 mm. Choose Continue when ready.</li>
+          <li><strong>Find and release contact:</strong> the routine descends in 0.01 mm steps at 0.1 mm/s, for at most 20 mm. ALPS contact stops the descent; the nozzle then lifts 5 mm at 0.5 mm/s.</li>
+          <li><strong>Tare and adjust:</strong> tare the unloaded scale and confirm. Klipper records the unloaded reference, then use fine Z steps to build the measured load.</li>
+          <li><strong>Measure and save:</strong> apply load with fine Z steps, enter the scale’s actual grams and record. Use Up to unload, then save; Klipper switches heaters off and restarts.</li>
+        </ol>
+        <fieldset id="load-calibration-options" class="probing-fields">
+          <legend>Calibration conditions</legend>
+          <div class="probing-grid">
+            <label for="load-calibration-max-counts">Calibration raw limit (counts)<input id="load-calibration-max-counts" type="number" min="90000" max="250000" step="any" value="120000" required aria-describedby="load-calibration-limit-guidance"></label>
+            <label for="load-calibration-hot"><input id="load-calibration-hot" type="checkbox" style="width:auto"> Calibrate at a chosen nozzle temperature</label>
+            <div id="load-calibration-hot-target-label" hidden><label for="load-calibration-hot-target">Manual nozzle target (°C)<input id="load-calibration-hot-target" type="number" min="50" max="300" step="any" value="210" required disabled></label></div>
+          </div>
+        </fieldset>
+        <p id="load-calibration-limit-guidance" class="chart-caption">Manual loading after tare: default 120,000 raw counts, adjustable from 90,000–250,000. Bed homing, mesh probing and the initial scale search use a separate 120,000-count overload limit. These are sensor-signal limits, not rated mechanical forces. Verify the load cell, hotend mount and scale capacities before loading.</p>
+        <p id="load-calibration-hot-guidance" class="chart-caption" hidden>Set the chosen nozzle temperature manually in Klipper’s controls. This page does not turn heaters on. The routine waits within ±2°C of that target for 30 seconds before its baseline. Confirm that the scale/contact surface tolerates the hot nozzle before contact.</p>
+        <div class="button-row"><button id="load-calibration-start" class="button primary" disabled>Start scale routine</button><button id="load-calibration-simulate" class="button secondary" disabled>Simulate scale routine</button><button id="load-calibration-abort" class="button danger" disabled>Stop calibration</button></div>
+        <p id="load-calibration-readiness" class="chart-caption"></p>
+        <p id="load-calibration-message" class="inline-message" role="status"></p>
+        <p id="load-calibration-sensor" class="chart-caption"></p>
+        <p id="load-calibration-temperature" class="chart-caption" role="status"></p>
+        <div id="load-calibration-confirmation" class="probe-confirmation" hidden><h3 id="load-calibration-confirm-title"></h3><p id="load-calibration-confirm-detail"></p><button id="load-calibration-confirm" class="button primary" disabled>Confirm</button></div>
+        <h3>Move nozzle in Z</h3>
+        <p class="chart-caption">Use these controls before the automatic scale search, after tare to apply a measured load, and for upward release after a recoverable contact failure. One click makes one movement; XY and orientation stay fixed. Downward positioning stops on contact; only the load calibration stage permits fine steps to build load.</p>
+        <p id="load-calibration-z-status" class="inline-message" role="status">Start the scale routine and complete its confirmations to enable Z steps.</p>
+        <div class="calibration-z-grid" aria-label="Direct Z baby steps">
+          <button class="button secondary" data-calibration-step="10" disabled>↑ Up 10 mm</button>
+          <button class="button secondary" data-calibration-step="1" disabled>↑ Up 1 mm</button>
+          <button class="button secondary" data-calibration-step="0.1" disabled>↑ Up 0.1 mm</button>
+          <button class="button secondary" data-calibration-step="0.05" disabled>↑ Up 0.05 mm</button>
+          <button class="button secondary" data-calibration-step="-10" disabled>↓ Down 10 mm</button>
+          <button class="button secondary" data-calibration-step="-1" disabled>↓ Down 1 mm</button>
+          <button class="button secondary" data-calibration-step="-0.1" disabled>↓ Down 0.1 mm</button>
+          <button class="button secondary" data-calibration-step="-0.05" disabled>↓ Down 0.05 mm</button>
+        </div>
+        <div id="load-z-navigation" class="probe-confirmation" hidden>
+          <p id="load-z-position" class="chart-caption"></p>
+          <div class="button-row"><button id="load-z-continue" class="button primary" disabled hidden>Continue — find scale</button><button id="load-z-finish" class="button secondary" disabled hidden>Finish recovery</button></div>
+          <p class="chart-caption">Recovery keeps the original unloaded ALPS reference. Use Up 0.1 mm or finer while loaded; larger Up steps become available after release. Finish recovery ends this attempt without saving calibration. Start a new scale routine afterward. Sensor faults, lost control and unconfirmed stops do not enable dashboard release.</p>
+        </div>
+        <div id="load-calibration-steps" class="probe-confirmation" hidden>
+          <h3>Fine adjustment and measured load</h3>
+          <label for="load-step-size">Additional Z step sizes</label>
+          <select id="load-step-size"><option value="10">10 mm</option><option value="1">1 mm</option><option value="0.5">0.5 mm</option><option value="0.1">0.1 mm</option><option value="0.05">0.05 mm</option><option value="0.01" selected>0.01 mm</option><option value="0.001">0.001 mm</option></select>
+          <div class="button-row"><button id="load-step-up" class="button secondary" disabled>↑ Up — release load</button><button id="load-step-down" class="button secondary" disabled>↓ Down — apply load</button></div>
+          <p id="load-calibration-position" class="chart-caption"></p>
+          <p id="load-step-guidance" class="chart-caption" role="status"></p>
+          <label for="load-calibration-grams">Scale reading (g)<input id="load-calibration-grams" type="number" min="50" max="25000" step="any" required placeholder="Enter the actual stable reading" aria-describedby="load-calibration-record-guidance"></label>
+          <button id="load-calibration-record" class="button primary" disabled>Record measured load</button>
+          <p id="load-calibration-record-guidance" class="chart-caption">Enter the stable load shown by the weighing scale, from 50–25,000 g. This input range is not a mechanical rating. Record sends the measured value to Klipper’s load-cell calibration; it does not move the arm. Do not infer grams from uncalibrated counts. An accepted measurement is used once; stop and restart calibration if that value needs correction.</p>
+          <p class="chart-caption">Travel is limited to 25 mm above detected contact and 0.25 mm below it. Down steps larger than 0.1 mm must finish at least 0.5 mm above contact; use 0.1 mm or finer to apply load. Use Up to unload before saving. At the calibration load limit, only upward release of 0.1 mm or finer is available while feedback remains valid. Sensor, temperature and motion faults still stop the routine.</p>
+          <button id="load-calibration-finish" class="button primary" disabled>Save calibration &amp; finish</button>
+          <p id="load-calibration-save-guidance" class="chart-caption" role="status">Record a measured load, then use Up until the scale is unloaded. Save turns heaters off and runs Klipper SAVE_CONFIG, which restarts Klipper. It does not move the robot.</p>
+        </div>
+        <p id="load-calibration-result" class="inline-message" role="status"></p>
+        <p class="chart-caption">After a verified save, configure ALPS Logger to read Klipper’s saved counts_per_gram and reference_tare_counts. A separate two-weight logger calibration is not required.</p>
+        <button id="load-calibration-clear-session" class="button secondary" disabled>Clear unfinished Klipper calibration</button>
+        <p class="chart-caption">Discards an unfinished Klipper load-cell calibration; saved values are kept. Use if an earlier console session is still open.</p>
+        <button id="calibration-open-logger" class="button secondary" type="button">Open ALPS Logger tab</button>
+      </section>
       <section class="card" aria-label="Job configuration"><h2>4. Job configuration</h2>
         <p class="muted">Choose which heaters to check. Preflight heats only the selected heaters to their G-code targets, then switches all heaters off before checking the robot. Robot preflight does not move the arm.</p>
         <fieldset id="heater-check-options" class="heater-check-options" aria-describedby="heater-options-note">
@@ -180,6 +270,7 @@
         <p id="clock-options-note" class="chart-caption">Checking clock timing support…</p>
         <p id="clock-speed-note" class="chart-caption"></p>
         <p id="clock-measurement" class="chart-caption" role="status"></p>
+        <p id="print-tracking" class="chart-caption" role="status"></p>
         <p id="heartbeat-measurement" class="chart-caption" role="status"></p>
       </section>
       <section class="card"><button id="setup-continue" class="button primary" type="button">Continue to G-code dashboard →</button></section>

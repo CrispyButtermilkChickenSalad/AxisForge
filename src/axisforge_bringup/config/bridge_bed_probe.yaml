@@ -2,14 +2,17 @@
 # as an example, not a factory default. Its onboard filter differs from the
 # Klipper ADS131M02 stream; commission these counts on the actual assembly.
 contact:
+  # Switch to klipper_probe after real calibration and native-event validation;
+  # see Klipper-AxisForge-Bridge/docs/native-probe.md. Raw guards remain active.
+  trigger_source: stream
   trigger_mode: raw
   contact_delta_counts: 20000.0
-  max_delta_counts: 60000.0
+  max_delta_counts: 120000.0
   step_mm: 0.01
-  speed_mm_s: 0.1
+  speed_mm_s: 0.5
   retract_mm: 0.5
-  samples: 5
-  repeatability_mm: 0.02
+  samples: 2
+  repeatability_mm: 0.03
   contact_offset_mm: 0.0
   settle_s: 0.15
   window_s: 0.1
@@ -18,18 +21,23 @@ contact:
   consecutive_samples: 5
 homing:
   # Continuous Z passes with acceleration/deceleration ramps and cruise speed.
-  first_speed_mm_s: 10.0
-  second_speed_mm_s: 0.2
+  first_speed_mm_s: 5.0
+  second_speed_mm_s: 0.5
   lift_speed_mm_s: 20.0
   mesh_columns: 3
   mesh_rows: 3
+  mesh_clearance_mm: 3.0 # Above the highest measured surface for mesh XY travel.
+  mesh_search_step_mm: 0.1 # Cancel on contact; then refine with bounded 0.01 mm landings.
+  mesh_yaw_deg: 0.0 # Bed +X/+Y follow Base +X/+Y; home above the bed centre.
   acceleration_mm_s2: 50.0
   # Host-observed freshness/stop rejection limits, not hardware force limits.
   sample_age_s: 0.15
   cancel_timeout_s: 0.2
   max_stop_travel_mm: 0.5
   retract_mm: 3.0
-  max_descent_mm: 20.0
+  # Estimate the vertical nozzle-to-bed gap at the arm home/start pose, then add
+  # 50 mm; keep this bounded search within 5..350 mm. Contact stops descent early.
+  max_descent_mm: 350.0
   max_retest_difference_mm: 0.5
   clearance_above_start_mm: 10.0
   # XY travel inherits max_travel_speed_mm_s from ur_master.yaml.

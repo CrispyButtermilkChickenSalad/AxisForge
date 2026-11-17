@@ -112,6 +112,22 @@ class MotionPlannerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Invalid IK/joint state'):
                 self.planner.check_joints(joints)
 
+    def test_link_height_error_reports_the_actual_frame_and_unchanged_limit(self):
+        # Fold the shoulder toward the floor, well inside angular limits.
+        joints = np.zeros(6)
+        joints[1] = np.pi/2
+        heights = [float(frame.t[2])*1000 for frame in self.planner.robot.fkine_all(joints)]
+        lowest = min(heights)
+        index = heights.index(lowest)
+        self.assertLess(lowest, self.config.min_link_z_mm)
+        with self.assertRaises(ValueError) as caught:
+            self.planner.check_joints(joints)
+        message = str(caught.exception)
+        self.assertIn('DH link %d' % index, message)
+        self.assertIn('Base Z %.3f mm' % lowest, message)
+        self.assertIn('configured -20.000 mm limit', message)
+        self.assertEqual(self.planner.config.min_link_z_mm, -20.)
+
     def test_tcp_and_orientation_errors_are_still_rejected(self):
         planner = self.planner
         pose = planner.robot.fkine(self.seed)

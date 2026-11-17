@@ -640,6 +640,23 @@ cancels the active trajectory. The result goes to `bed_probe_file` unless `--out
 
 #### Guided ALPS homing and mesh from the dashboard
 
+Once the quick and fine homing passes establish Home, mesh failures automatically
+attempt a guarded return to that cycle's corrected starting pose. Contact is
+released upward before clearance lift and XY travel. A returned arm does not make
+the scan valid: the error remains visible and the previous mesh is preserved.
+Operator Stop, unhealthy feedback/sensor data, unconfirmed termination or an unsafe
+return path keeps the arm stopped; failed returns are not retried automatically.
+
+Successful synchronized prints now lift 10 mm from the last print point in robot
+Base +Z, keeping X/Y and orientation unchanged. This is configured with
+`post_print_lift_mm: 10.0` and `return_to_homing_pose: false` in `ur_master.yaml`.
+Extrusion finishes and heaters turn off before the lift. Model and UR safety
+checks run at preflight and again before execution; heartbeat ownership lasts
+until the lifted pose is verified. Aborted or failed jobs stay stopped. Mesh
+failure recovery still returns to its established Home. See the bridge's
+[probing and print-quality notes](Klipper-AxisForge-Bridge/README.md#home-and-probe-the-bed-with-alps)
+for Z-reference and physical motion-tracking diagnostics.
+
 In **Setup & calibration**, the **Home & probe bed** card runs the homing and mesh routine
 inside Klipper–AxisForge Bridge. AxisForge moves the arm and records nozzle TCP
 height from fresh joint feedback; Klipper supplies ALPS samples. The bare nozzle
@@ -647,41 +664,85 @@ is the contact probe, so no paper thickness or separate XY probe offset is used.
 Klipper `PROBE` and `BED_MESH_CALIBRATE` do not move the arm in this arrangement.
 
 Start the UR driver and External Control program, with Remote Control selected and
-the speed slider at 100%. Position the clean, cool nozzle **upright and unloaded**,
-clear of the flat build surface. Both heater targets must be zero and the nozzle
-must be below 50 °C. The routine checks the starting orientation and preserves it;
-it does not make an initial joint-space approach or automatically rotate the tool.
-Leave room for the subsequent lift and mesh travel before starting.
+the speed slider at 100%. Position the clean nozzle **within 0.5° of upright and unloaded**,
+clear of the flat build surface. Cold probing requires both heater targets zero
+and the nozzle at or below 50 °C. For hot measurements, enable **Probe at printing
+temperatures** in Setup & calibration, set matching targets in Klipper, and select
+the temperature soak (5–1800 seconds; 60 seconds by default). Either heater can stay off with
+target 0; a configured bed heater is required for a nonzero bed target. The routine
+waits for the selected temperatures within ±2 °C before robot initialization and
+fresh unloaded ALPS taring, and stops on target changes or temperature drift.
+It does not send heater commands; the targets remain under manual Klipper control
+after completion, cancellation or failure. Native hot probing requires the updated
+`axisforge_probe` module's `heated_probing` capability. After the first surface
+confirmation, the routine corrects a small starting tilt around the nozzle tip
+over at least **3 seconds**, then verifies the stopped upright pose and unloaded
+sensor before enabling Z positioning. The correction is limited to **0.5°** and
+must pass the controller's safety checks; larger errors stop the routine.
+This works each time you return to a tilted saved Home waypoint, without editing
+that waypoint. Leave room around the toolhead for rotation and for the subsequent
+lift and mesh travel before starting.
+
+**Redo homing & mesh** is available whenever the robot is ready and the pipeline
+is idle, including after a successful mesh. A failed rescan leaves the previous
+map active; a successful scan and return replace it with a timestamped backup.
+Recorded maps include the selected thermal settings and measured temperatures.
 
 1. Press **Home & probe bed**. Confirm that the flat build surface is beneath the
-   nozzle, and that the nozzle is clean, cool, clear of the surface and unloaded.
-   This confirmation establishes the session's unloaded sensor baseline.
-2. The arm descends continuously in **Z only**, accelerating to **10 mm/s**,
-   stopping on sustained load detection. Descent is bounded to **20 mm** below
-   the saved starting position; failure to find contact stops the routine.
-3. It retracts **3 mm**, verifies that the load clears, and makes **two precision
-   contacts at 0.2 mm/s**, retracting and checking for released load between them.
-   Only these slow contacts determine bed height. They must agree within the
-   selected repeatability tolerance; the fast touch is an approximate location.
+   nozzle, and that the nozzle is clean, at the selected probing temperature,
+   clear of the surface and unloaded.
+   If alignment is needed, the confirmation displays its angle and authorizes
+   it. The routine records the unloaded baseline and verifies alignment before
+   opening Z controls. The planned tip path stays within **0.0025 mm** and the
+   measured final orientation must be within **0.05°** of the configured upright pose.
+   Use **Up / Down 10, 1, 0.1 or 0.05 mm** to adjust Z, then choose **Continue —
+   start Z homing**. Each downward positioning step stops on contact. The routine
+   captures the adjusted pose as its search and return starting position.
+2. The arm descends continuously in **Z only**, accelerating to **5 mm/s** by default,
+   stopping on sustained load detection. Descent is bounded by **Maximum Z search**
+   below the saved starting position (default **350 mm**, adjustable **5–350 mm**);
+   failure to find contact within that distance stops the routine.
+3. It retracts **3 mm**, verifies that the load clears, and makes **one precision
+   contact** at the saved fine speed (**0.5 mm/s in the current profile**), then
+   retracts and checks for released load again.
+   Initial homing is exactly **one quick + one fine contact**. Only the fine
+   contact determines bed height; the fast touch is an approximate location.
 4. It lifts vertically to **10 mm above the original starting Z**, then moves in
    XY to the existing first mesh point: G-code **X30 Y30** with the default grid,
    transformed using the configured bed origin and nozzle TCP. The dashboard waits
    for confirmation that this is the intended **front-leftmost mesh point**.
 5. After that confirmation, it automatically measures the selected serpentine
-   grid (default **3×3**, selectable **2–9 points per axis**) at **0.1 mm/s**. Each point uses **five contacts**; the default accepted Z
-   spread is **0.02 mm**. The median measured contact is saved.
+   grid (default **3×3**, selectable **2–9 points per axis**) at **0.1 mm/s**.
+   Choose **1–5 contacts per point**. With two or more, the default accepted Z
+   spread is **0.02 mm** and the median measured contact is saved. A single
+   contact saves its measured height with repeatability marked as unmeasured.
 6. It lifts to a clear height, returns in XY, then moves in Z to the **saved starting
    nozzle position and orientation**. This returns to the pose captured at the
-   beginning, not a separate pendant-defined Home pose.
+   beginning after alignment and Z positioning, not a separate pendant-defined Home pose.
 
-Upward homing and mesh moves use **20 mm/s** by default, including the 0.5 mm
+Upward homing and mesh moves use **10 mm/s** by default, including the 0.5 mm
 retraction between mesh contacts, the 3 mm homing retraction, and clearance lifts.
+Between mesh points, `homing.mesh_clearance_mm` defaults to **3 mm** above
+the highest surface measured so far (including centre homing). This reduces
+the approach distance while clearing known high spots. It is separate from
+the fine rehoming backoff, first-point confirmation height, and printing clearance.
 The dashboard can adjust this independently from downward probing (1–20 mm/s).
 XY moves at clearance height inherit AxisForge’s `max_travel_speed_mm_s`, currently
 **120 mm/s** in `ur_master.yaml`, instead of the old bridge-specific 5 mm/s.
 Travel still accelerates/decelerates and respects joint limits; very short lifts
 may finish before reaching the requested speed. A legacy `homing.travel_speed_mm_s`
 can lower XY speed but cannot exceed the AxisForge limit.
+
+Homing and scale searches keep their monitored session open after a recoverable
+contact failure and offer **Lift clear** Z controls. Recovery preserves the
+original unloaded ALPS reference and permits only upward movement: use 0.1 mm or
+finer while loaded, then larger steps after fresh readings confirm release.
+**Finish recovery** ends the failed attempt; retry with new surface/scale
+confirmation before another automatic search. It does not save a partial mesh or
+calibration. Abort, lost sensor/control feedback and an unconfirmed stop remain
+terminal faults. A session that has already exited cannot enable Z motion from
+its old dashboard status. Arm power, brakes, mode selection, XY positioning and
+orientation continue to use the existing manual controls.
 
 Mesh X/Y counts are independent integers from **2 to 9** (4–81 points total).
 Changing density preserves the saved bed dimensions, edge margin (30 mm by default)
@@ -707,15 +768,37 @@ Each homing pass uses one trajectory with smooth acceleration/deceleration ramps
 and a constant-speed middle at the selected speed. It does not stop at individual
 waypoints or wait for settled samples during descent. ALPS is monitored throughout;
 contact cancels the trajectory, and fresh stationary feedback is required before
-recording height or retracting. Contact close to the starting position can happen
+recording height or retracting. A 0.8-second post-cancellation feedback window
+checks joint velocity, raw position excursions, drift and pose-estimate convergence.
+Initial residual velocity, pose drift or oscillation may leave the rolling window
+within the original 2-second settling deadline; a full passing window is still
+required. The 0.01 mm / 100 microradian drift limits are unchanged, and drift
+errors include the measured values. Any renewed motion after
+the first accepted stationary pose rejects the contact immediately.
+The accepted joint estimate and its forward-kinematics position are recorded as
+the contact, instead of taking another noisy single sample. These stability
+checks do not certify absolute robot accuracy. Contact close to the starting position can happen
 during acceleration. An infeasible path or joint limit rejects the pass instead
 of silently slowing its cruise. Mesh approaches also use continuous, slow motion;
 settling and repeated measurements occur at contact. Scale calibration retains
 its **0.1 mm/s** stepped contact search. Legacy `first_step_mm` and
 `second_step_mm` fields are accepted but are not used by continuous homing.
 
+Each new mesh point uses **0.1 mm near-contact search steps**
+(`homing.mesh_search_step_mm`), cancelled immediately when ALPS detects contact.
+This first contact, or an earlier contact during the continuous approach, only
+locates the surface. After stopping,
+that locator may relax below the measurement persistence threshold; it cannot
+be saved as a precision reading. After a guarded retract and unloaded check,
+the routine takes the configured number of bounded **0.01 mm precision contacts**.
+That locator is saved separately and never included
+in the repeatability comparison. A second early contact during refinement, or
+on a repeat at the same point, rejects the point. The initial centre homing
+sequence remains one locating pass plus one fine pass. Rejected repeats retain
+their individual heights, loads and baselines in the contact diagnostic file.
+
 Use **Setup & calibration → Home & probe bed → Homing and mesh settings** to save coarse
-search speed, precision rehoming speed, upward speed, mesh speed, X/Y point counts,
+search speed, maximum Z search distance, precision rehoming speed, upward speed, mesh speed, X/Y point counts,
 readings per mesh point, and repeatability tolerance. Settings can be edited with hardware disconnected and
 apply on the next run. Saving is blocked during robot operations and invalidates
 job preflight. Revision checking prevents one browser from overwriting another's
@@ -724,12 +807,20 @@ acceleration and safety limits remain available for deliberate file-based tuning
 Lower speed and repeatable readings reduce measurement variation; the repeatability
 setting does not certify absolute accuracy or compensate hotend deflection.
 
+Set **Maximum Z search** by estimating the vertical nozzle-to-bed gap at the arm's
+home/start pose and adding **50 mm**. For example, a 300 mm gap uses the default
+350 mm limit. Review the limit whenever the starting pose changes. Contact stops
+the descent early, and reaching the limit without contact stops the routine. The
+full search path must pass reach, path and joint-limit checks before motion.
+Saving the setting does not start homing; the surface confirmation remains required.
+
 Continuous homing rejects latest ALPS samples older than **150 ms**, uses a
 **200 ms** action-cancellation deadline with independent UR Stop fallback, and
 rejects observed travel beyond **0.5 mm after host detection**. These are software
 rejection limits, not verified physical stopping distances or force limits. The
-observed ALPS delivery is about 100 ms per batch: at 10 mm/s the nozzle can travel
-about 1 mm before a contact report arrives, plus stopping travel. Commission actual
+updated Klipper probe module requests 25 ms ALPS host batches (previously 100 ms).
+At 5 mm/s, 25 ms corresponds to 0.125 mm of travel before stopping travel; actual
+delivery timing remains monitored rather than assumed. Commission actual
 contact and stopping distance under supervision. Different pass speeds can affect
 post-stop deflection and repeatability. Stop acknowledgement time and observed
 post-detection travel are recorded with the homing readings.
@@ -753,7 +844,7 @@ The default native profile is
 [`bridge_bed_probe.yaml`](src/axisforge_bringup/config/bridge_bed_probe.yaml). It uses
 **raw ADC-count changes**, so grams calibration is not required: contact is a
 sustained absolute change of **20,000 counts** from the unloaded baseline, with a
-maximum excursion of **60,000 counts**. Both pressure polarities are accepted.
+maximum excursion of **120,000 counts**. Both pressure polarities are accepted.
 The baseline belongs to this session; the routine does not change Klipper's
 `counts_per_gram`, reference tare, calibration flag or printer configuration.
 
@@ -896,39 +987,68 @@ upload/preflight/start workflow is in the next tab. Complete these steps:
    Ethernet/joint feedback, Remote Control, arm state, External Control, speed
    scaling, and the saved AxisForge nozzle offset. Power-on, brake release, mode
    selection, program Load/Play, installation TCP and payload remain manual.
-2. For ALPS calibration, press **Start scale routine**. Manually move to a home
-   pose with an upright, clean, cool nozzle, then confirm. Place the weighing
-   scale on the buildplate below the nozzle with a small unloaded gap (≤20 mm),
-   then confirm separately. The routine descends along base Z at **0.1 mm/s** in
+2. Use **Home & probe bed** to locate the build surface and measure its mesh.
+   Set the search range for the current nozzle-to-bed gap and follow the surface
+   and front-left confirmations. Initial search accepts **0.5–10 mm/s**; save the
+   homing settings before starting to apply a different speed.
+3. For ALPS calibration, press **Start scale routine**. Confirm the current start
+   pose with an upright, clean nozzle. XY and orientation still use your existing
+   arm controls; dashboard Z positioning follows the unloaded scale confirmation.
+   Cold mode is the default;
+   optional hot calibration requires manually heating to the chosen target and
+   maintaining ±2°C for 30 seconds before the routine proceeds. Place the weighing
+   scale on the buildplate below the unloaded nozzle, then confirm separately.
+   Use the dashboard Z buttons to leave a small unloaded gap (≤20 mm), then
+   choose **Continue — find scale**. The routine descends along base Z at **0.1 mm/s** in
    **0.01 mm** steps, stops on raw ALPS contact, and lifts **5 mm** at 0.5 mm/s.
-3. Tare the weighing scale and confirm. Use **Up / Down** for individual
+4. Tare the unloaded weighing scale and confirm; the routine starts Klipper
+   `LOAD_CELL_CALIBRATE` and captures its unloaded tare reference. Use the eight
+   direct **Up / Down** buttons for individual
    **10, 1, 0.1 or 0.05 mm** Z steps; 0.5, 0.01 and 0.001 mm are also available.
-   Downward steps larger than 0.05 mm must end at least 0.5 mm above detected
+   Downward steps larger than 0.1 mm must end at least 0.5 mm above detected
    contact. Travel is bounded to **25 mm above contact and 0.25 mm below it**.
    Coarse clearance moves use 1 mm/s and stop if unexpected contact is detected;
    fine/load-release moves use 0.1 mm/s. Rotation and XY remain
-   fixed. Obtain two distinct, stable scale readings and enter each measured
-   weight in **ALPS Logger → Calibration** alongside its sensor reading. Return
-   to Setup to adjust the second load. Do not tare ALPS while loaded.
-4. Use **Up** to release the scale, then **Finish — scale unloaded**. Finish
-   holds the current pose and does not return home automatically. Remove the
-   scale, use **Home & probe bed**, choose job settings, then continue to the
+   fixed. Enter the actual stable **Scale reading (g)**, within 50–25,000 g, and
+   press **Record measured load** to send it to Klipper's calibration helper.
+   This input range is not a sensor/mount rating. Do not tare ALPS while loaded.
+   An accepted measurement is single-use; stop and restart to correct it.
+5. Use **Up** to release the scale, then **Save calibration & finish**. Saving
+   requires a recorded measurement and fresh stable unloaded feedback. It holds
+   the current pose, turns heaters off, runs `SAVE_CONFIG`, waits through the
+   Klipper restart and verifies the saved values. It does not return home
+   automatically. After verified success, ALPS Logger reads Klipper's saved
+   `counts_per_gram` and `reference_tare_counts`; no separate two-weight logger
+   calibration is needed. Remove the scale and re-probe if the build surface
+   moved. Choose job settings, then continue to the
    G-code dashboard. Calibration/homing invalidate old job preflight results.
 
-The scale routine uses raw counts without declaring the sensor calibrated. Its
-contact threshold is `max(8000, ceil(4.1 × unloaded peak-to-peak noise))`, capped
+If an earlier console calibration remains open, Start will reject it. Use
+**Clear unfinished Klipper calibration** while connected and idle to discard
+that helper session, preserving saved values, then start again. Clearing is
+explicit and never happens automatically. Stop is disabled during the final
+Klipper save/restart and verification; the robot is already stationary and the
+save cannot be undone.
+
+The scale routine uses raw counts during contact search and manual loading. Its
+contact threshold is `max(8000, ceil(4.1 × unloaded peak-to-peak noise))` cold, or
+`max(8000, ceil(2.5625 × noise))` in explicitly selected hot calibration, capped
 at 20000 counts; excess noise rejects the routine before movement. Five successive
-samples confirm contact and 60000 counts is the independent stop limit. See
+samples confirm contact and 120000 counts is the independent search stop limit.
+After the unloaded tare confirmation, manual calibration uses a separate limit:
+120000 counts by default, adjustable from 90000 to 250000 counts. This raw signal
+limit is not a rated force and does not change the bed-probing guard. See
 [`alps_load_calibration.yaml`](src/axisforge_bringup/config/alps_load_calibration.yaml).
 These are commissioning values, not a vendor factory default or known gram loads.
 Mellow's [tool](https://mellow.klipper.cn/en/docs/ToolsDoc/fly-alps-tool/) and
 [FAQ](https://mellow.klipper.cn/en/docs/ProductDoc/ExtensionBoard/fly-alps/faq/)
 describe threshold tuning; the onboard filtered signal differs from the raw
-Klipper ADC stream used here. The routine never writes ALPS/Klipper calibration
-or the bed map. Saving in the logger is a separate operator action; verify the
-calibration required by any later grams-based Klipper workflow independently.
+Klipper ADC stream used here. The measured load and unloaded tare are recorded
+through Klipper's calibration helper, then saved only after explicit Finish and
+verified after restart. The bed map is unchanged; simulations never write the
+calibration. Review the result before commissioning grams-based probing.
 
-The existing sensor/robot watchdogs, heater-off checks, process lock and independent
+The existing sensor/robot watchdogs, temperature checks, process lock and independent
 stop fallback apply to calibration. There is no queued jogging or automatic retry
 of motion. Abort stops without a return move. **Simulate scale routine** exercises
 the confirmations and synthetic contact without contacting either device.
@@ -952,6 +1072,34 @@ The `robot-connection` container supervises only the PC driver, separate from
 `bridge`, so refreshing/restarting the web dashboard does not shut down that driver.
 Its HTTP service binds to loopback port 8082. It starts passively at boot and only
 launches the UR driver after **Connect robot**; it never enables headless arm startup.
+The driver uses a local controller overlay built by `axisforge-build`. It fixes
+a Humble action-result race: if cancellation arrives after the controller queues
+success/abort but before its result timer runs, the queued terminal result must
+still be delivered. ROS explicitly permits those transitions from CANCELING.
+The patch changes two result-state checks in `realtime_tools`; trajectories,
+speed scaling, contact limits, stop deadlines and stationary checks retain their
+existing behavior. See [the ROS action state machine](https://github.com/ros2/rcl/blob/humble/rcl_action/src/rcl_action/goal_state_machine.c).
+
+For an existing installation, stop the arm program and PC driver, then run
+`docker compose exec dev bash scripts/build_controller_fix.sh`. This downloads
+checksum-pinned JTC 2.54.1 and UR controllers 2.15.0, verifies the installed
+realtime_tools 2.15.1 header, rebuilds both libraries under `.docker/controller-fix`,
+and exercises actual ROS action transitions in isolated domain 183. No hardware
+commands are sent by the build/tests. The driver checks the verified library and
+dependency hashes before loading the overlay; unsupported versions fail with a
+build/review instruction. A shared lock prevents rebuilding libraries while the
+driver uses them. After restarting the connection service, press **Connect robot**,
+then manually start External Control with Remote selected and the speed slider
+at 100%. An unconfirmed-stop fault still requires confirmation that the physical
+arm has stopped; restarting a web page does not establish that fact.
+The dashboard status/stop client is supervised and restarts after a transient
+startup failure. This reconnects its communication only; it never sends Play,
+power-on or brake-release commands.
+If a separate manual Dashboard TCP client disconnects it, the connection service
+also retries `/dashboard_client/connect` on an explicit disconnected response,
+at most once per 10 seconds. Controller startup waits up to 60 seconds for the
+controller manager, allowing time for recently closed driver ports to clear.
+
 The Docker daemon must start at boot. After the normal build, create the services:
 
 ```bash

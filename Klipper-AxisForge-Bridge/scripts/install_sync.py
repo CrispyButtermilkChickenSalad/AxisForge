@@ -11,11 +11,11 @@ import re
 import shutil
 
 
-def install(source, klipper, config):
+def install(source, klipper, config, native_probe=False):
     extras=klipper/'klippy/extras'
     if not extras.is_dir() or not config.is_file():
         raise ValueError('Check --klipper-dir and --config paths')
-    modules=['axisforge_sync.py','axisforge_schedule.py','axisforge_corners.py']
+    modules=['axisforge_sync.py','axisforge_schedule.py','axisforge_corners.py','axisforge_probe.py']
     for name in modules:
         compile((source/name).read_text(),name,'exec')
     original=config.read_text()
@@ -40,10 +40,13 @@ heater_timeout_seconds: 300
     for name in modules:
         if (extras/name).exists(): shutil.copy2(extras/name,backup/name)
         shutil.copy2(source/name,extras/name)
-    if not re.search(r'^\s*\[axisforge_sync\]\s*$',original,re.M):
+    additions = '' if re.search(r'^\s*\[axisforge_sync\]\s*$',original,re.M) else section
+    if native_probe and not re.search(r'^\s*\[axisforge_probe\]\s*$',original,re.M):
+        additions += '\n# Native ALPS trigger events for the external UR arm; no Klipper motion.\n[axisforge_probe]\n\n'
+    if additions:
         marker='#*# <---------------------- SAVE_CONFIG'
         offset=original.find(marker)
-        updated=original+section if offset<0 else original[:offset]+section+original[offset:]
+        updated=original+additions if offset<0 else original[:offset]+additions+original[offset:]
         config.write_text(updated)
     print('Installed modules. Backup: '+str(backup))
     print('When idle with heaters off: sudo systemctl restart klipper; then check /printer/axisforge_sync/capabilities.')
@@ -54,5 +57,7 @@ if __name__=='__main__':
     parser.add_argument('--source',type=Path,default=Path(__file__).resolve().parents[1]/'klipper_extras')
     parser.add_argument('--klipper-dir',type=Path,default=Path.home()/'klipper')
     parser.add_argument('--config',type=Path,default=Path.home()/'printer_data/config/printer.cfg')
+    parser.add_argument('--native-probe', action='store_true',
+                        help='Enable the native load_cell_probe event adapter (requires real calibration)')
     args=parser.parse_args()
-    install(args.source,args.klipper_dir,args.config)
+    install(args.source,args.klipper_dir,args.config,args.native_probe)

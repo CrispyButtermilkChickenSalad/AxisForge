@@ -20,9 +20,10 @@ from print_control.probe_control import EVENT_PREFIX, ProbeControl
 from print_control.bed_probe import grid_points
 from print_control.bed_surface import BedSurface
 from print_control.bridge_bed_probe import BridgeBedProbe, HomingOptions, load_profile
-from print_control.gcode_path import GCodeConfig
+from print_control.gcode_path import GCodeConfig, GCodePlanner
 from print_control.load_cell_bed_probe import LoadCellBedProbe, SimulatedAlps
 from print_control.motion_planner import MotionConfig, MotionPlanner
+from print_control.probe_motion import plan_probe_descent
 
 
 def raw_samples(values):
@@ -222,8 +223,12 @@ class GuidedProbeHarness(BridgeBedProbe):
     def __init__(self, output):
         self.settings = GCodeConfig(z_offset=100., bed_probe_file='')
         self.config = MotionConfig(dry_run=True, clearance_mm=6., tcp_offset_mm=(-100., 0., 117.06))
-        self.planner = SimpleNamespace(config=self.config, check_pose=lambda *args: None)
-        self.args = SimpleNamespace(config='unused', floor_mm=3., paper_mm=0., load_cell='load_cell_probe')
+        rotation = SE3.RPY(self.config.nozzle_rpy_deg, unit='deg', order='zyx').R
+        self.planner = SimpleNamespace(config=self.config, rotation=rotation,
+            kinematic_model={'kind':'nominal_ur16e'},
+                                      check_pose=lambda *args, **kwargs: None,
+                                      kinematics=SimpleNamespace(eval=lambda q: SE3.Rt(rotation, np.zeros(3)).A))
+        self.args = SimpleNamespace(config='unused', floor_mm=3., paper_mm=0., load_cell='load_cell_probe',margin_mm=30.)
         self.output = Path(output)
         self.points = grid_points(self.settings.bed_size_mm, 30.)
         self.records = {}; self.index = 0; self.promoted = False; self.returned = False
@@ -237,21 +242,30 @@ class GuidedProbeHarness(BridgeBedProbe):
         self.control = ProbeControl(io.StringIO(), io.StringIO(), clock=lambda: 100.)
         self.moves = []; self.confirmed_stages = []; self.touches = []; self.saved = []
         self.reject_stage = None; self.fail_return = False; self.shift_on_confirm = None
-        self.contacts_z = [99.8, 99.81, 99.80]
+        self.contacts_z = [99.8, 99.81]
         self.stop_unconfirmed = False
 
-    def capture_start(self):
+    def capture_start(self, *, allow_alignment=False):
+        self._nominal_probe_rotation = self.planner.rotation.copy()
         self.start_xyz = self.initial_xyz.copy(); self.target = self.start_xyz.copy()
         self.start_joints = np.zeros(6); self.seed = self.start_joints.copy()
 
     def robot_reason(self): return ''
 
+    def manual_z_session(self, **kwargs):
+        # Routine orchestration tests skip operator steps. The shared Z-control
+        # tests exercise their movement and load guards independently.
+        self.start_xyz, self.start_joints = self.target.copy(), self.seed.copy()
+
     def nozzle_now(self): return self.target.copy(), self.seed.copy()
+
+    def z_waiting_anchor(self): return self.nozzle_now()
 
     def pump(self):
         pending = self.control.pending
         if pending is not None:
             if pending['stage'] == self.reject_stage:
+                self.control.cancel('Operator declined '+pending['stage'])
                 raise RuntimeError('Operator declined '+pending['stage'])
             self.confirmed_stages.append(pending['stage'])
             if self.shift_on_confirm is not None: self.target += self.shift_on_confirm
@@ -273,8 +287,10 @@ class GuidedProbeHarness(BridgeBedProbe):
         return {'nozzle': self.target.copy(), 'joints': self.seed.copy(), 'load': 20500.,
                 'peak_load': 20500., 'tare_counts': 0.}
 
-    def homing_touch(self, *, floor_z, speed_mm_s):
-        return self.touch_once(floor_z=floor_z, speed_mm_s=speed_mm_s)
+    def homing_touch(self, *, floor_z, speed_mm_s, locating_only=False, precision_reference_z=None):
+        result = self.touch_once(floor_z=floor_z, speed_mm_s=speed_mm_s)
+        result['contact_persistence_checked'] = not locating_only
+        return result
 
     def retract_contact(self, *, distance_mm=None, speed_mm_s=None):
         self.move_z(self.target[2]+distance_mm, 'contact retract',
@@ -284,7 +300,7 @@ class GuidedProbeHarness(BridgeBedProbe):
         z = 99.82+self.index*.001
         nozzle = self.target.copy(); nozzle[2] = z
         self.records[self.index] = {'point': self.index+1, 'grid_xy': list(self.points[self.index]),
-                                   'nozzle_base_mm': nozzle.tolist(), 'bed_z_mm': z,
+                                   'nozzle_base_mm': nozzle.tolist(), 'gcode_xy':self.gcode_xy(nozzle).tolist(), 'bed_z_mm': z,
                                    'joints_rad': self.seed.tolist()}
         self.save()
 
@@ -299,15 +315,48 @@ class GuidedRoutineTests(unittest.TestCase):
         self.output = Path(self.temp.name)/'bed_probe.yaml'; self.output.write_text('old mesh\n')
         self.probe = GuidedProbeHarness(self.output)
 
+    def test_alignment_precedes_z_positioning_and_homing_and_is_saved(self):
+        order=[]
+        baseline=self.probe.set_baseline
+        positioning=self.probe.manual_z_session
+        def tare():
+            order.append('tare');baseline()
+        def align():
+            self.assertEqual(self.probe.confirmed_stages,['surface'])
+            self.assertIsNotNone(self.probe.detector)
+            self.assertEqual(self.probe.moves,[])
+            order.append('align')
+            self.probe.start_alignment={'required':False,'state':'aligned','residual_deg':.001}
+        def position(**kwargs):
+            order.append('position');positioning(**kwargs)
+        with patch.object(self.probe,'set_baseline',side_effect=tare), \
+             patch.object(self.probe,'align_homing_start',side_effect=align), \
+             patch.object(self.probe,'manual_z_session',side_effect=position):
+            self.probe.run_routine()
+        self.assertEqual(order[:3],['tare','align','position'])
+        self.assertEqual(len(self.probe.touches),2)
+        self.assertEqual(yaml.safe_load(self.output.read_text())['start_alignment']['state'],'aligned')
+
+    def test_failed_alignment_never_descends_or_overwrites_existing_mesh(self):
+        with patch.object(self.probe,'align_homing_start',side_effect=RuntimeError('Alignment failed')), \
+             patch.object(self.probe,'manual_z_session') as positioning:
+            with self.assertRaisesRegex(RuntimeError,'Alignment failed'):
+                self.probe.run_routine()
+            positioning.assert_not_called()
+        self.assertEqual(self.probe.moves,[])
+        self.assertEqual(self.probe.touches,[])
+        self.assertEqual(self.output.read_text(),'old mesh\n')
+
     def test_routine_orders_confirmations_contacts_transit_mesh_and_safe_return(self):
         self.probe.run_routine()
         self.assertEqual(self.probe.confirmed_stages, ['surface', 'front_left'])
-        self.assertEqual(len(self.probe.touches), 3)
-        first, second, third = self.probe.touches
-        self.assertEqual(first['floor'], 85.)
-        self.assertEqual(first['speed'], 10.)
+        self.assertEqual(len(self.probe.touches), 2)
+        first, second = self.probe.touches
+        self.assertEqual([r['contact_persistence_checked'] for r in self.probe.homing_readings],
+                         [False, True])
+        self.assertEqual(first['floor'], self.probe.start_xyz[2] - 350.)
+        self.assertEqual(first['speed'], 5.)
         self.assertEqual(second['speed'], .2)
-        self.assertEqual(third['speed'], .2)
         self.assertIsNone(first['step'])
         self.assertIsNone(second['step'])
         self.assertAlmostEqual(second['floor'], 99.3)
@@ -322,7 +371,7 @@ class GuidedRoutineTests(unittest.TestCase):
         np.testing.assert_equal(lift['from'][:2], lift['to'][:2])
         self.assertEqual(lift['to'][2], self.probe.initial_xyz[2]+10.)
         self.assertEqual(transit['from'][2], transit['to'][2])
-        self.assertEqual(lift['speed'], 20.)
+        self.assertEqual(lift['speed'], 10.)
         self.assertEqual(transit['speed'], self.probe.settings.max_travel_speed_mm_s)
         np.testing.assert_equal(transit['to'][:2], self.probe.bed_point(self.probe.points[0])[:2])
         for move in self.probe.moves:
@@ -330,7 +379,7 @@ class GuidedRoutineTests(unittest.TestCase):
             if move['name'] in ('mesh hover', 'mesh travel'):
                 self.assertIn('front_left', move['confirmed'])
             if move['name'] in ('contact retract', 'mesh lift', 'return clearance lift'):
-                self.assertEqual(move['speed'], 20.)
+                self.assertEqual(move['speed'], 10.)
             if move['name'] in ('mesh travel', 'return XY'):
                 self.assertEqual(move['speed'], self.probe.settings.max_travel_speed_mm_s)
         final = self.probe.moves[-3:]
@@ -366,10 +415,10 @@ class GuidedRoutineTests(unittest.TestCase):
     def test_lift_speed_applies_to_mesh_retract_but_not_explicit_scale_release(self):
         with patch.object(LoadCellBedProbe, 'retract_contact') as retract:
             BridgeBedProbe.retract_contact(self.probe)
-            retract.assert_called_with(distance_mm=None, speed_mm_s=20.)
-            self.probe.homing = replace(self.probe.homing, lift_speed_mm_s=10.)
+            retract.assert_called_with(distance_mm=None, speed_mm_s=10.)
+            self.probe.homing = replace(self.probe.homing, lift_speed_mm_s=15.)
             BridgeBedProbe.retract_contact(self.probe, distance_mm=3.)
-            retract.assert_called_with(distance_mm=3., speed_mm_s=10.)
+            retract.assert_called_with(distance_mm=3., speed_mm_s=15.)
             BridgeBedProbe.retract_contact(self.probe, distance_mm=5., speed_mm_s=.5)
             retract.assert_called_with(distance_mm=5., speed_mm_s=.5)
 
@@ -391,7 +440,7 @@ class GuidedRoutineTests(unittest.TestCase):
     def test_declining_front_left_confirmation_never_starts_mesh(self):
         self.probe.reject_stage = 'front_left'
         with self.assertRaisesRegex(RuntimeError, 'declined front_left'): self.probe.run_routine()
-        self.assertEqual(len(self.probe.touches), 3); self.assertFalse(self.probe.records)
+        self.assertEqual(len(self.probe.touches), 2); self.assertFalse(self.probe.records)
         self.assertEqual(self.probe.moves[-1]['name'], 'front-left travel')
         self.assertEqual(self.output.read_text(), 'old mesh\n')
 
@@ -401,9 +450,39 @@ class GuidedRoutineTests(unittest.TestCase):
             self.probe.run_routine()
         self.assertFalse(self.probe.moves); self.assertFalse(self.probe.touches)
 
-    def test_disagreeing_contacts_prevent_mesh_and_return(self):
-        self.probe.contacts_z = [99.8, 99.81, 99.1]
-        with self.assertRaisesRegex(ValueError, 'repeatability'): self.probe.run_routine()
+    def test_confirmation_uses_fixed_median_reference_instead_of_opposite_raw_noise_extremes(self):
+        self.probe.capture_start()
+        anchor = (self.probe.target.copy(), self.probe.seed.copy())
+        def confirm(stage, message, pump, **kwargs):
+            for noise in (-.07, .07):
+                self.probe.target = anchor[0]+[noise, 0., 0.]
+                pump()
+        with patch.object(self.probe, 'z_waiting_anchor', return_value=anchor), \
+                patch.object(self.probe.control, 'wait_confirmation', side_effect=confirm):
+            self.probe.confirm_position('front_left', 'Confirm')
+        np.testing.assert_array_equal(self.probe.target, anchor[0])
+
+    def test_motion_during_confirmation_is_rejected_before_return_to_original_pose(self):
+        self.probe.capture_start()
+        def confirm(stage, message, pump, **kwargs):
+            original = self.probe.target.copy()
+            self.probe.target += [.2, 0., 0.]
+            pump()
+            self.probe.target = original
+        with patch.object(self.probe.control, 'wait_confirmation', side_effect=confirm):
+            with self.assertRaisesRegex(RuntimeError, 'moved while awaiting confirmation'):
+                self.probe.confirm_position('front_left', 'Confirm')
+        self.assertFalse(self.probe.moves)
+
+    def test_failed_fine_contact_prevents_mesh_and_return(self):
+        touch = self.probe.homing_touch
+        def failed_fine(**kwargs):
+            if self.probe.touches:
+                raise RuntimeError('Fine contact measurement rejected')
+            return touch(**kwargs)
+        self.probe.homing_touch = failed_fine
+        with self.assertRaisesRegex(RuntimeError, 'Fine contact measurement rejected'):
+            self.probe.run_routine()
         self.assertFalse(self.probe.records); self.assertFalse(self.probe.returned)
         self.assertFalse(any(m['name'] == 'front-left travel' for m in self.probe.moves))
 
@@ -416,6 +495,30 @@ class GuidedRoutineTests(unittest.TestCase):
         data = yaml.safe_load(self.output.with_suffix('.pending.yaml').read_text())
         self.assertFalse(data['complete']); self.assertFalse(data['homing']['returned_to_start'])
 
+    def test_failed_mesh_point_returns_home_but_keeps_previous_map_active(self):
+        probe_current=self.probe.probe_current
+        def fail_point():
+            if self.probe.index==1:raise RuntimeError('Contact repeatability 0.0209 exceeds 0.0200')
+            probe_current()
+        self.probe.probe_current=fail_point
+        with self.assertRaisesRegex(RuntimeError,'returned to established Home'):
+            self.probe.run_routine()
+        self.assertEqual(len(self.probe.records),1)
+        self.assertFalse(self.probe.returned)
+        self.assertEqual(self.probe.failure_recovery['state'],'returned')
+        np.testing.assert_allclose(self.probe.target,self.probe.start_xyz)
+        self.assertEqual(self.output.read_text(),'old mesh\n')
+        self.assertFalse(yaml.safe_load(self.output.with_suffix('.pending.yaml').read_text())['complete'])
+
+    def test_saved_mesh_records_selected_temperature_and_measured_heaters(self):
+        thermal={'mode':'heated','options':{'nozzle_target_c':210.,'bed_target_c':60.,'soak_s':60.},
+            'temperatures':{'extruder':{'temperature_c':210.2,'target_c':210.}},'locked':True}
+        self.probe.thermal_policy=SimpleNamespace(status=lambda:thermal,require_ready=lambda:None)
+        self.probe.run_routine()
+        data=yaml.safe_load(self.output.read_text())
+        self.assertEqual(data['probing_temperature'],thermal)
+        self.assertTrue(data['homing']['returned_to_start'])
+
     def test_capture_rejects_tilt_and_preserves_small_measured_orientation_without_moving(self):
         self.probe.capture_start()
         self.probe.config = replace(self.probe.config, dry_run=False)
@@ -426,7 +529,7 @@ class GuidedRoutineTests(unittest.TestCase):
             pose[:3, 3] = self.probe.target/1000.
             planner = SimpleNamespace(config=self.probe.config, rotation=nominal, offset_m=np.zeros(3),
                                       kinematics=SimpleNamespace(eval=lambda q: pose), check_joints=lambda q: None)
-            planner.check_pose = lambda q, start, end: MotionPlanner.check_pose(planner, q, start, end)
+            planner.check_pose = lambda q, start, end, **kwargs: MotionPlanner.check_pose(planner, q, start, end, **kwargs)
             self.probe.planner = planner
             return pose[:3, :3]
         configure(1.)
@@ -438,8 +541,79 @@ class GuidedRoutineTests(unittest.TestCase):
         np.testing.assert_allclose(SE3.RPY(self.probe.config.nozzle_rpy_deg, unit='deg', order='zyx').R, actual)
         self.assertFalse(self.probe.moves)
 
+    def test_surface_confirmation_freezes_current_orientation_before_fast_descent(self):
+        self.check_confirmation_orientation('surface')
+
+    def test_scale_confirmation_freezes_current_orientation_before_contact(self):
+        self.check_confirmation_orientation('scale')
+
+    def check_confirmation_orientation(self, stage):
+        # Measured UR pose that exposed the startup mismatch: even .003 degrees
+        # between the initial sample and confirmation is too much to correct in
+        # the first 10 ms of a continuous trajectory.
+        confirmed = np.array([.1686267852783203, -1.1174641710570832,
+                              1.361110035573141, -1.8143464527525843,
+                              -1.5708163420306605, .17175784707069397])
+        self.probe.config = replace(self.probe.config, dry_run=False,
+                                    path_tolerance_mm=.0025)
+        self.probe.settings = replace(self.probe.settings, lookahead_enabled=False)
+        self.probe.planner = planner = GCodePlanner(self.probe.settings, self.probe.config)
+        actual = planner.kinematics.eval(confirmed)[:3, :3]
+        rpy = SE3.Rt(actual, np.zeros(3)).rpy(unit='deg', order='zyx')
+        old_rotation = SE3.RPY(rpy + [0., .003, 0.], unit='deg', order='zyx').R
+        nozzle = planner.nozzle_position(confirmed)
+        result = planner.kinematics.ikine_LM(planner.tool_pose(nozzle, old_rotation),
+                                            q0=confirmed, joint_limits=True, tol=1e-14, slimit=1)
+        self.assertTrue(result.success)
+        self.probe.seed = result.q.copy()
+        self.probe.target = planner.nozzle_position(result.q)
+        BridgeBedProbe.capture_start(self.probe)
+        with self.assertRaisesRegex(ValueError, 'joint acceleration too high'):
+            plan_probe_descent(planner, nozzle, nozzle-[0., 0., 20.], confirmed, 10., 50.)
+
+        def confirmed_pose(*args, **kwargs):
+            self.probe.target, self.probe.seed = nozzle.copy(), confirmed.copy()
+        with patch.object(self.probe.control, 'wait_confirmation', side_effect=confirmed_pose):
+            self.probe.confirm_position(stage, 'Confirm initial contact surface')
+        np.testing.assert_allclose(planner.rotation, actual, atol=1e-14)
+        np.testing.assert_allclose(planner.rotation_for((0., 0., 0.)), actual, atol=1e-14)
+        motion = plan_probe_descent(planner, self.probe.target,
+                                    self.probe.target-[0., 0., 20.], self.probe.seed, 10., 50.)
+        np.testing.assert_allclose(motion.positions[0], confirmed, atol=1e-14)
+        np.testing.assert_allclose(planner.nozzle_position(motion.positions[-1]),
+                                   nozzle-[0., 0., 20.], atol=.0025)
+        self.assertFalse(self.probe.moves)
+
+    def test_surface_confirmation_rechecks_nominal_upright_before_reanchoring(self):
+        self.probe.capture_start()
+        nominal = self.probe._nominal_probe_rotation.copy()
+        # Each sample can be within .2 degrees of the previous one while the
+        # final sample is outside the nominal upright limit.
+        earlier = SE3.RPY((180.15, 0., 90.), unit='deg', order='zyx').R
+        tilted = SE3.RPY((180.3, 0., 90.), unit='deg', order='zyx').R
+        pose = SE3.Rt(tilted, self.probe.target/1000.).A
+        planner = SimpleNamespace(config=self.probe.config, rotation=earlier,
+                                  offset_m=np.zeros(3), kinematics=SimpleNamespace(eval=lambda q: pose))
+        planner.check_pose = lambda *args, **kwargs: MotionPlanner.check_pose(planner, *args, **kwargs)
+        self.probe.planner = planner
+        with self.assertRaisesRegex(ValueError, 'Orientation error'):
+            self.probe.confirm_position('surface', 'Confirm surface')
+        np.testing.assert_array_equal(self.probe._nominal_probe_rotation, nominal)
+        np.testing.assert_array_equal(planner.rotation, earlier)
+        self.assertFalse(self.probe.moves)
+
+    def test_front_left_confirmation_keeps_orientation_frozen(self):
+        self.probe.capture_start()
+        rotation = self.probe.planner.rotation.copy()
+        with patch.object(self.probe, 'freeze_probe_orientation',
+                          side_effect=AssertionError('must not re-anchor after homing')):
+            self.probe.confirm_position('front_left', 'Confirm front-left')
+        np.testing.assert_array_equal(self.probe.planner.rotation, rotation)
+
     def test_bounded_homing_configuration_rejects_unlimited_or_reversed_motion(self):
-        for change in ({'max_descent_mm': 1000.}, {'first_speed_mm_s': 10.01},
+        for change in ({'max_descent_mm': 1000.}, {'max_descent_mm': 350.01},
+                       {'max_descent_mm': 4.99}, {'max_descent_mm': True},
+                       {'max_descent_mm': 5., 'retract_mm': 5.}, {'first_speed_mm_s': 10.01},
                        {'second_speed_mm_s': 10.}, {'first_speed_mm_s': .1},
                        {'first_speed_mm_s': 0.}, {'second_speed_mm_s': float('inf')},
                        {'acceleration_mm_s2': 101.}, {'sample_age_s': .3},
@@ -453,32 +627,83 @@ class GuidedRoutineTests(unittest.TestCase):
 
     def test_native_profile_applies_homing_speeds_without_speeding_mesh_or_scale(self):
         config = Path(__file__).resolve().parents[2]/'axisforge_bringup'/'config'
-        contact, homing = load_profile(config/'bridge_bed_probe.yaml')
-        self.assertEqual(homing.first_speed_mm_s, 10.)
-        self.assertEqual(homing.second_speed_mm_s, .2)
-        self.assertEqual(homing.lift_speed_mm_s, 20.)
+        # Exercise independent values without binding a regression test to the
+        # operator's mutable dashboard speed setting.
+        profile = yaml.safe_load((config/'bridge_bed_probe.yaml').read_text())
+        profile['contact']['speed_mm_s'] = .07
+        profile['contact']['repeatability_mm'] = .02
+        profile['homing']['second_speed_mm_s'] = .13
+        profile['homing']['lift_speed_mm_s'] = 8.
+        fixture = Path(self.temp.name)/'profile.yaml'
+        fixture.write_text(yaml.safe_dump(profile))
+        contact, homing = load_profile(fixture)
+        # The saved initial search speed is editable independently of its default.
+        self.assertEqual(HomingOptions().first_speed_mm_s, 5.)
+        self.assertEqual(HomingOptions(first_speed_mm_s=10.).first_speed_mm_s, 10.)
+        # The saved search distance is editable for the current nozzle-to-bed gap.
+        self.assertEqual(HomingOptions().max_descent_mm, 350.)
+        self.assertEqual(HomingOptions(max_descent_mm=5.).max_descent_mm, 5.)
+        self.assertEqual(HomingOptions(max_descent_mm=20.).max_descent_mm, 20.)
+        self.assertEqual(homing.second_speed_mm_s, .13)
+        self.assertEqual(homing.lift_speed_mm_s, 8.)
+        self.assertEqual(HomingOptions().lift_speed_mm_s, 10.)
         self.assertIsNone(homing.travel_speed_mm_s)
         self.assertEqual((homing.mesh_columns, homing.mesh_rows), (3, 3))
         self.assertEqual((homing.first_step_mm, homing.second_step_mm), (.05, .01))
-        self.assertEqual(contact.speed_mm_s, .1)
-        self.assertEqual(contact.samples, 5)
+        self.assertEqual(contact.speed_mm_s, .07)
+        self.assertIn(contact.samples, range(1, 6))  # Operator-editable saved setting.
         self.assertEqual(contact.repeatability_mm, .02)
+        self.assertEqual(contact.max_delta_counts, 120000.)
         scale, _ = load_profile(config/'alps_load_calibration.yaml')
         self.assertEqual(scale.speed_mm_s, .1)
+        self.assertEqual(scale.max_delta_counts, 120000.)
         # Existing customized slower profiles remain valid.
         self.assertEqual(HomingOptions(first_speed_mm_s=.5, second_speed_mm_s=.1).first_speed_mm_s, .5)
 
     def test_only_precise_contacts_determine_homed_height(self):
-        self.probe.contacts_z = [98.8, 99.81, 99.80]
+        self.probe.contacts_z = [98.8, 99.81]
         self.probe.run_routine()
         self.assertAlmostEqual(self.probe.homed_z, 99.83)
-        self.assertAlmostEqual(self.probe.homing_repeatability_mm, .01)
+        self.assertIsNone(self.probe.homing_repeatability_mm)
 
     def test_mesh_uses_selected_slow_continuous_contact(self):
         self.probe.homing_touch = lambda **kwargs: kwargs
         result = self.probe.mesh_touch()
         self.assertEqual(result['speed_mm_s'], self.probe.contact_options.speed_mm_s)
         self.assertEqual(result['floor_z'], 97.)
+
+    def test_mesh_clearance_is_separate_and_clears_measured_high_spots(self):
+        original_retract = self.probe.homing.retract_mm
+        original_print_clearance = self.probe.config.clearance_mm
+        xy = self.probe.points[0]
+        bed = self.probe.bed_point(xy)[2]
+        self.assertAlmostEqual(self.probe.hover(xy)[2], bed+3.)
+        self.probe.records = {0: {'bed_z_mm': bed+.8}}
+        self.assertAlmostEqual(self.probe.hover(xy)[2], bed+3.8)
+        self.probe._point_readings = [{'nozzle': np.array([0.,0.,bed+1.2])}]
+        self.assertAlmostEqual(self.probe.hover(xy)[2], bed+4.2)
+        self.assertEqual(self.probe.homing.retract_mm, original_retract)
+        self.assertEqual(self.probe.config.clearance_mm, original_print_clearance)
+
+    def test_homing_start_defines_mesh_centre_despite_old_saved_origin(self):
+        self.probe.run_routine()
+        first=next(m for m in self.probe.moves if m['name']=='front-left travel')
+        expected=self.probe.start_xyz[:2]-np.asarray(self.probe.settings.bed_size_mm)/2+self.probe.args.margin_mm
+        np.testing.assert_allclose(first['to'][:2],expected)
+        data=yaml.safe_load(self.output.read_text())
+        np.testing.assert_allclose(data['bed_frame']['center_base_mm'],self.probe.start_xyz[:2])
+        self.assertEqual(data['bed_frame']['source'],'homing_center')
+
+    def test_repeat_mesh_contact_shortens_only_the_already_known_search_range(self):
+        self.probe.homing_touch=lambda **kwargs:kwargs
+        first=self.probe.mesh_touch()
+        self.probe._point_reference_z=100.2
+        repeated=self.probe.mesh_touch()
+        self.assertEqual(first['floor_z'],97.)
+        self.assertEqual(repeated['floor_z'],99.7)
+        self.assertEqual(first['speed_mm_s'],repeated['speed_mm_s'])
+        self.probe._point_reference_z=96.
+        self.assertEqual(self.probe.mesh_touch()['floor_z'],97.)
 
     def test_unresolved_trajectory_stop_uses_dashboard_stop_and_does_not_resume(self):
         self.probe.config = replace(self.probe.config, dry_run=False)

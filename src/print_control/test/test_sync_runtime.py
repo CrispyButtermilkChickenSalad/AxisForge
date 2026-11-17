@@ -4,7 +4,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, Mock
 
 import numpy as np
 from print_control.sync_runtime import RobotWorker, ROSRobot, serve
@@ -34,6 +34,43 @@ class WorkerTests(unittest.TestCase):
             chunks=[SimpleNamespace(positions=np.zeros((2,6)))])
         self.worker.state='ready'
         self.data={'session':self.worker.session}
+
+    def test_finish_print_requires_finished_chunks_and_keeps_lease_until_verified(self):
+        self.worker.acquire(self.data)
+        self.worker.compiled.finish_move={'kind':'lift','distance_mm':10.}
+        self.worker.compiled.planner=SimpleNamespace(nozzle_position=lambda q:q[:3],
+            kinematics=SimpleNamespace(eval=lambda q:np.eye(4)))
+        self.worker.compiled.finish_print=Mock(return_value=[SimpleNamespace(positions=np.array([[0,0,0,0,0,0],[0,0,10,0,0,0]]))])
+        self.backend.validate_motion=Mock()
+        with self.assertRaisesRegex(ValueError,'all print chunks'):self.worker.finish_print(self.data)
+        self.worker.state='at_boundary';self.worker.next_chunk=1
+        with self.assertRaisesRegex(ValueError,'not completed'):self.worker.complete(self.data)
+        phases=[]
+        def execute(*args,**kwargs):
+            self.assertTrue(self.worker.lease)
+            self.assertEqual(self.backend.validate_motion.call_count,1)
+            self.backend.joints=lambda:np.array([0.,0.,10.,0.,0.,0.])
+            phases.append(kwargs['phase'])
+        with patch.object(self.worker,'_execute',side_effect=execute):
+            self.worker.finish_print(self.data);self.worker.thread.join(2.)
+        self.assertEqual(phases,['finishing_print'])
+        self.assertTrue(self.worker.finish_completed)
+        with self.assertRaisesRegex(ValueError,'once'):self.worker.finish_print(self.data)
+        self.assertEqual(self.worker.complete(self.data)['state'],'complete')
+
+    def test_return_safety_failure_never_sends_motion_or_marks_success(self):
+        self.worker.acquire(self.data)
+        self.worker.compiled.finish_move={'kind':'lift','distance_mm':10.}
+        self.worker.compiled.planner=SimpleNamespace(nozzle_position=lambda q:q[:3],
+            kinematics=SimpleNamespace(eval=lambda q:np.eye(4)))
+        self.worker.compiled.finish_print=Mock(return_value=[object()])
+        self.backend.validate_motion=Mock(side_effect=RuntimeError('Safety plane'))
+        self.worker.state='at_boundary';self.worker.next_chunk=1
+        with patch.object(self.worker,'_execute') as execute:
+            self.worker.finish_print(self.data);self.worker.thread.join(2.)
+            execute.assert_not_called()
+        self.assertEqual(self.worker.state,'fault')
+        self.assertFalse(self.worker.finish_completed)
 
     def test_lease_ownership_and_disabled_motion(self):
         with self.assertRaisesRegex(ValueError,'Unknown'): self.worker.acquire({'session':'wrong'})
@@ -175,6 +212,25 @@ class WorkerTests(unittest.TestCase):
         data.update(index=1,clock_uncertainty_s=.001)
         with self.assertRaisesRegex(ValueError,'index'): self.worker.schedule(data)
         self.assertFalse(self.backend.cancelled)
+
+    def test_schedule_converts_master_clock_units_before_robot_dispatch(self):
+        from print_control.motion_planner import PlannedMotion
+        self.worker.acquire(self.data);self.worker.state='at_boundary'
+        original=PlannedMotion('test',np.zeros((2,6)),np.zeros((2,6)),np.array([0.,600.]))
+        self.worker.compiled.chunks=[original]
+        data=dict(self.data,index=0,start_monotonic=self.now+1,clock_uncertainty_s=.003,print_time_rate=1.0000365)
+        with self.assertRaisesRegex(ValueError,'preflighted motion margin'):self.worker.schedule(data)
+        self.worker.compiled.max_clock_rate=1.001
+        for rate in (True,0.,1.002,.998):
+            with self.assertRaises(ValueError):self.worker.schedule(dict(data,print_time_rate=rate))
+        sent=[]
+        def execute(motion,start,generation,index,accepted):
+            sent.append(motion);accepted.set_result(True)
+        with patch.object(self.worker,'_execute',side_effect=execute):
+            self.worker.schedule(data);self.worker.thread.join(1.)
+        self.assertAlmostEqual(sent[0].times[-1],600./1.0000365)
+        self.assertEqual(original.times[-1],600.)
+        self.assertIs(sent[0].positions,original.positions)
 
     def test_clock_policy_is_saved_during_prepare_and_resets_for_legacy_requests(self):
         compiled=self.worker.compiled

@@ -9,4 +9,5 @@ cd /workspace
 # Model installation needs the mounted files and is intentionally a runtime step.
 bash scripts/install_ur_models.sh
 bash scripts/build.sh "$@"
+bash scripts/build_controller_fix.sh
 echo 'Build complete. Open a new Bash session or run: source /etc/axisforge/env.bash'

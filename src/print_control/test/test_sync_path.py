@@ -3,6 +3,8 @@
 import copy
 import math
 import unittest
+import tempfile
+import yaml
 from pathlib import Path
 
 import numpy as np
@@ -24,8 +26,21 @@ def plan():
 
 
 class TimedPathTests(unittest.TestCase):
+    def setUp(self):
+        # Timing tests must not depend on an operator's in-progress bed resize
+        # or partially commissioned map. Bed-frame loading has its own tests.
+        source = Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        data = yaml.safe_load(source.read_text())
+        data['gcode_interpreter']['ros__parameters'].update(
+            bed_size_mm=[235., 235.], x_offset=-854.63, y_offset=-497.28,
+            z_offset=100., origin_at_center=True, bed_probe_file='', kinematics_file='', return_to_homing_pose=False, post_print_lift_mm=0.)
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        self.config = Path(root.name)/'test_motion.yaml'
+        self.config.write_text(yaml.safe_dump(data))
+
     def test_exact_master_times_and_rotated_tip(self):
-        config = Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        config = self.config
         compiled = TimedPath(config,plan(),np.deg2rad([-3.73,-90,-120,-60,90,0]))
         motion = compiled.chunks[0]
         self.assertEqual(motion.times[0],0.)
@@ -41,13 +56,24 @@ class TimedPathTests(unittest.TestCase):
         modified['plan_hash']=canonical_hash({k:v for k,v in modified.items() if k!='plan_hash'})
         with self.assertRaisesRegex(ValueError,'duration'): validate_plan(modified)
 
+    def test_post_print_lift_preflight_uses_last_endpoint_without_home(self):
+        data=yaml.safe_load(self.config.read_text())
+        data['gcode_interpreter']['ros__parameters']['post_print_lift_mm']=10.
+        self.config.write_text(yaml.safe_dump(data))
+        compiled=TimedPath(self.config,plan(),np.deg2rad([-3.73,-90,-120,-60,90,0]))
+        self.assertEqual(compiled.finish_move,{'kind':'lift','distance_mm':10.})
+        self.assertIsNone(compiled.home)
+        start=compiled.planner.nozzle_position(compiled.chunks[-1].positions[-1])
+        end=compiled.planner.nozzle_position(compiled.finish_preview[-1].positions[-1])
+        np.testing.assert_allclose(end,start+[0,0,10.],atol=.0025)
+
     def test_too_fast_is_rejected_instead_of_retimed(self):
         value=plan()
         p=value['operations'][0]['moves'][0]['profile']
         p.update(acceleration=10000.,velocity=100.,ramp_s=.01,duration_s=.02)
         value['operations'][0]['duration_s']=.02
         value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
-        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        config=self.config
         with self.assertRaisesRegex(ValueError,r'(speed|acceleration).*Klipper.*axisforge_sync'):
             TimedPath(config,value,np.deg2rad([-3.73,-90,-120,-60,90,0]))
 
@@ -70,7 +96,7 @@ class TimedPathTests(unittest.TestCase):
                     profile={'acceleration':accel,'velocity':velocity,'ramp_s':ramp,
                              'cruise_s':cruise,'duration_s':duration})
         value['plan_hash']=canonical_hash({k:v for k,v in value.items() if k!='plan_hash'})
-        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        config=self.config
         compiled=TimedPath(config,value,np.deg2rad([-3.73,-90,-120,-60,90,0]))
         motion=compiled.chunks[0]
         self.assertEqual(motion.times[0],0.)
@@ -122,7 +148,7 @@ class TimedPathTests(unittest.TestCase):
 
     def test_continuous_junction_has_nonzero_joint_velocity_and_exact_timing(self):
         value=self.continuous_plan()
-        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        config=self.config
         compiled=TimedPath(config,value,np.deg2rad([-3.73,-90,-120,-60,90,0]))
         motion=compiled.chunks[0]
         junction=np.flatnonzero(motion.times==1.5)
@@ -148,7 +174,7 @@ class TimedPathTests(unittest.TestCase):
             validate_plan(value)
 
     def test_firmware_corner_modes_validate_actual_joint_interpolation(self):
-        config=Path(__file__).resolve().parents[2]/'axisforge_bringup/config/ur_master.yaml'
+        config=self.config
         for policy in ('klipper','marlin'):
             value=self.continuous_plan()
             value['motion_options']={'policy':policy}

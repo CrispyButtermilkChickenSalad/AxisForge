@@ -89,3 +89,31 @@ class BedSettingsTests(unittest.TestCase):
                      CONFIG.replace('    bed_probe_margin_mm: 30.0','    bed_probe_margin_mm: 30.0\n    bed_probe_margin_mm: 10.0')):
             self.path.write_text(text)
             with self.assertRaises(BedSettingsError): self.store.status()
+
+    def test_measured_centre_and_rotation_replace_legacy_corner_in_status(self):
+        mesh = self.root/'mesh.yaml'
+        mesh.write_text(yaml.safe_dump({'complete':True, 'transform':{'bed_size_mm':[235.,235.]},
+            'bed_frame':{'source':'homing_center','center_base_mm':[-640.,-385.],
+                         'size_mm':[235.,235.],'yaw_deg':90.}}))
+        self.path.write_text(CONFIG.replace('bed_probe_file: ""','bed_probe_file: '+str(mesh)))
+        result = self.store.status()
+        self.assertEqual(result['front_left_base_mm'], [-522.5,-502.5])
+        self.assertFalse(result['bed_mesh']['requires_probe'])
+        result = self.save()
+        self.assertIsNone(result['front_left_base_mm'])
+        self.assertTrue(result['bed_mesh']['requires_probe'])
+
+    def test_calibration_change_rejects_old_model_mesh_in_status(self):
+        import hashlib
+        calibration = self.root/'arm.yaml';calibration.write_text('calibration: test\n')
+        mesh = self.root/'mesh.yaml'
+        data = {'transform':{'bed_size_mm':[235.,235.]}}
+        mesh.write_text(yaml.safe_dump(data))
+        self.path.write_text(CONFIG.replace('bed_probe_file: ""','bed_probe_file: '+str(mesh))+
+                             '    kinematics_file: '+str(calibration)+'\n')
+        self.assertTrue(self.store.status()['bed_mesh']['requires_probe'])
+        data['kinematic_model'] = {'kind':'ur_calibration','sha256':hashlib.sha256(calibration.read_bytes()).hexdigest()}
+        mesh.write_text(yaml.safe_dump(data))
+        self.assertFalse(self.store.status()['bed_mesh']['requires_probe'])
+        calibration.write_text('calibration: changed\n')
+        self.assertTrue(self.store.status()['bed_mesh']['requires_probe'])

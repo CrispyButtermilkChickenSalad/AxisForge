@@ -6,6 +6,7 @@ import math
 import numpy as np
 import roboticstoolbox as rtb
 from spatialmath import SE3
+from print_control.ur_kinematics import NOMINAL_MODEL, calibrated_model
 
 JOINT_NAMES = (
     'shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
@@ -22,6 +23,7 @@ class MotionConfig:
     approach_duration_s: float = 8.0
     clearance_mm: float = 10.0
     tcp_offset_mm: tuple = (0.0, 0.0, 0.0)
+    kinematics_file: str = ''
     waypoint_spacing_mm: float = 1.0
     dry_run: bool = True
     dry_run_seed_deg: tuple = (-145.0, -128.0, -94.0, -47.0, 90.0, 35.0)
@@ -50,6 +52,10 @@ class MotionConfig:
         unrestricted = {'min_link_z_mm'}
         for field in fields(self):
             name, value = field.name, getattr(self, field.name)
+            if name == 'kinematics_file':
+                if not isinstance(value, str):
+                    raise ValueError('kinematics_file must be a path string')
+                continue
             if name == 'dry_run':
                 if not isinstance(value, bool):
                     raise ValueError('dry_run must be a boolean')
@@ -125,6 +131,12 @@ class MotionPlanner:
             chain = chain * link.ets
             self.link_kinematics.append(chain)
         self.base_z = float(self.robot.base.t[2])
+        self.kinematic_model = dict(NOMINAL_MODEL)
+        if config.kinematics_file:
+            self.robot, self.kinematics, self.link_kinematics, self.kinematic_model = calibrated_model(
+                config.kinematics_file, config.joint_limits_deg)
+            self.joint_limits = self.robot.qlim
+            self.base_z = 0.
         self.rotation = SE3.RPY(config.nozzle_rpy_deg, unit='deg', order='zyx').R
         self.offset_m = np.asarray(config.tcp_offset_mm) / 1000.0
 
@@ -147,10 +159,18 @@ class MotionPlanner:
             raise ValueError('Joint position exceeds configured limits')
         # Evaluate the same DH link frames through RTB's compiled ETS path,
         # avoiding thousands of short-lived SE3 objects during interpolation.
-        min_z_mm = min(self.base_z, *(chain.eval(joints)[2, 3]
-                                     for chain in self.link_kinematics)) * 1000
+        link_heights_m = (self.base_z, *(chain.eval(joints)[2, 3]
+                                       for chain in self.link_kinematics))
+        min_z_mm = min(link_heights_m) * 1000
         if min_z_mm < self.config.min_link_z_mm:
-            raise ValueError('A link origin is below min_link_z_mm')
+            index = link_heights_m.index(min(link_heights_m))
+            prefix = 'calibrated link' if self.config.kinematics_file else 'DH link'
+            name = ('robot base' if index == 0 else 'tool0' if index > len(JOINT_NAMES)
+                    else '%s %d (%s)' % (prefix, index, JOINT_NAMES[index-1]))
+            raise ValueError(
+                'A link origin is below min_link_z_mm: %s has Base Z %.3f mm, '
+                'below the configured %.3f mm limit' %
+                (name, min_z_mm, self.config.min_link_z_mm))
 
     def check_pose(self, joints, start, end, rotation=None, path_tolerance_mm=None):
         """Check tip distance to a segment and fixed orientation on the model."""
@@ -188,10 +208,13 @@ class MotionPlanner:
         return joints
 
     def check_motion(self, motion, xyz=None, pose_at=None,
-                     timing_hint='reduce speed or increase approach_duration_s',path_tolerance_mm=None):
+                     timing_hint='reduce speed or increase approach_duration_s',path_tolerance_mm=None,
+                     pump=None, clock_rate=1.):
         """Sample cubic geometry; also include each joint's velocity extrema."""
         cfg = self.config
         for index, dt in enumerate(np.diff(motion.times)):
+            if pump is not None:
+                pump()
             if dt <= 0 or round(dt * 1e9) < 1:
                 raise ValueError('Trajectory times must increase by at least 1 ns')
             q0, q1 = motion.positions[index:index + 2]
@@ -207,8 +230,8 @@ class MotionPlanner:
             for fraction in samples:
                 q, velocity, acceleration = cubic_joint_state(q0, q1, v0, v1, dt, fraction)
                 self.check_joints(q)
-                speed = np.abs(np.rad2deg(velocity))
-                accel = np.abs(np.rad2deg(acceleration))
+                speed = np.abs(np.rad2deg(velocity))*clock_rate
+                accel = np.abs(np.rad2deg(acceleration))*clock_rate**2
                 if np.max(speed) > cfg.max_joint_speed_deg_s:
                     joint = int(np.argmax(speed))
                     raise ValueError(

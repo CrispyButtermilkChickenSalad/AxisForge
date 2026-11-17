@@ -1,5 +1,6 @@
-"""Only the fixed PC driver may be launched; all UR service requests are read-only."""
+"""Driver startup and dashboard reconnection never actuate the arm."""
 import asyncio
+import json
 import fcntl
 from pathlib import Path
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from unittest.mock import AsyncMock
 
 from bridge_dashboard.robot_connection import RobotConnection, RobotConnectionError
+from bridge_dashboard.rosbridge import RosBridge
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
@@ -67,3 +69,77 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
         self.settings.robot_ip='$(unsafe)'
         with self.assertRaises(RobotConnectionError):await self.manager.connect()
         self.spawn.assert_not_awaited()
+
+    async def test_disconnected_dashboard_reconnects_without_starting_arm(self):
+        self.nodes=['/dashboard_client'];self.fresh=True
+        original=self.ros.call_service;connected=False
+        async def service(path,kind):
+            nonlocal connected
+            if path=='/dashboard_client/connect':
+                self.calls.append(path);connected=True;return {'success':True}
+            if path=='/dashboard_client/is_in_remote_control' and not connected:
+                return {'success':False,'remote_control':False,
+                        'answer':'Failed to send request to dashboard server. Are you connected to the Dashboard Server?'}
+            return await original(path,kind)
+        self.ros.call_service=service
+        await self.manager.refresh()
+        self.assertTrue(self.manager.status()['ready'])
+        self.assertEqual(self.calls.count('/dashboard_client/connect'),1)
+        self.assertFalse(any(path.endswith(('/play','/power_on','/brake_release')) for path in self.calls))
+
+    async def test_failed_reconnection_is_rate_limited_and_shown_as_connection_fault(self):
+        self.nodes=['/dashboard_client'];self.fresh=True
+        original=self.ros.call_service
+        async def service(path,kind):
+            if path=='/dashboard_client/connect':
+                self.calls.append(path);return {'success':False}
+            if path=='/dashboard_client/is_in_remote_control':
+                return {'success':False,'remote_control':False,'answer':'Not connected'}
+            return await original(path,kind)
+        self.ros.call_service=service;self.manager.clock=lambda:100.
+        await self.manager.refresh();await self.manager.refresh()
+        self.assertEqual(self.calls.count('/dashboard_client/connect'),1)
+        self.assertFalse(self.manager.status()['ready'])
+        self.assertIn('dashboard connection',self.manager.status()['message'])
+        self.manager.clock=lambda:111.
+        await self.manager.refresh()
+        self.assertEqual(self.calls.count('/dashboard_client/connect'),2)
+
+    async def test_local_mode_does_not_trigger_reconnect_or_play(self):
+        self.nodes=['/dashboard_client'];self.fresh=True
+        original=self.ros.call_service
+        async def service(path,kind):
+            if path=='/dashboard_client/is_in_remote_control':
+                return {'success':True,'remote_control':False}
+            return await original(path,kind)
+        self.ros.call_service=service
+        await self.manager.refresh()
+        self.assertNotIn('/dashboard_client/connect',self.calls)
+        self.assertIn('Select Remote',self.manager.status()['message'])
+
+    async def test_real_ros_rpc_recovers_local_to_remote_disconnect_without_actuation(self):
+        self.nodes=['/dashboard_client'];self.fresh=True
+        ros=RosBridge('ws://simulated');ros._connected=True
+        self.manager.ros=ros
+        connected=True;remote=False
+        async def send(payload):
+            nonlocal connected
+            request=json.loads(payload);path=request['service'];self.calls.append(path)
+            if path=='/rosapi/nodes':values={'nodes':self.nodes}
+            elif path=='/dashboard_client/connect':connected=True;values={'success':True}
+            elif not connected:values={'success':False,'remote_control':False,'answer':'Failed to send request to dashboard server. Are you connected to the Dashboard Server?'}
+            elif path=='/dashboard_client/is_in_remote_control':values={'success':True,'remote_control':remote}
+            elif path=='/dashboard_client/get_robot_mode':values={'success':True,'robot_mode':{'mode':7}}
+            elif path=='/dashboard_client/get_loaded_program':values={'success':True,'program_name':'external.urp'}
+            else:raise AssertionError('Unexpected service '+path)
+            ros._handle_message(dict(op='service_response',id=request['id'],result=True,values=values))
+        ros._socket=SimpleNamespace(send=send)
+        await self.manager.refresh()
+        self.assertFalse(self.manager.status()['ready'])
+        self.assertIn('Select Remote',self.manager.status()['message'])
+        self.assertNotIn('/dashboard_client/connect',self.calls)
+        connected=False;remote=True
+        await self.manager.refresh()
+        self.assertTrue(self.manager.status()['ready'])
+        self.assertEqual(self.calls.count('/dashboard_client/connect'),1)
+        self.assertFalse(any(path.endswith(('/play','/power_on','/brake_release','/stop')) for path in self.calls))

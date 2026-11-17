@@ -151,6 +151,9 @@ footer { padding: 0 20px 28px; color: #718096; text-align: center; font-size: .7
 .probing-fields { margin: 16px 0 8px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; }
 .probing-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 16px; }
 .probing-grid input { width: 100%; }
+.calibration-z-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin: 12px 0; }
+.calibration-z-grid .button { min-width: 0; padding: 10px 6px; white-space: normal; }
+@media (max-width: 650px) { .calibration-z-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 #probing-form { margin-top: 22px; }
 #probing-form h3 { margin: 0; }
 @media (max-width: 560px) { .tcp-grid { grid-template-columns: 1fr; } }

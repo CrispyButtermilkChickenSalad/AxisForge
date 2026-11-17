@@ -28,7 +28,7 @@ Partial results go to *.pending.yaml; only a complete grid replaces the bed map.
 """
 
 
-def sensor_setup(args, options=None):
+def sensor_setup(args, options=None, *, status_validator=None, check_baseline=True, native_thermal_targets=None):
     if options is None:
         path = Path(args.sensor_config) if args.sensor_config else Path(args.config).with_name('load_cell_bed_probe.yaml')
         data = yaml.safe_load(path.read_text())
@@ -48,11 +48,30 @@ def sensor_setup(args, options=None):
     url = args.moonraker_url or env.get('MOONRAKER_URL')
     if not url: raise ValueError('Set MOONRAKER_URL in .env or supply --moonraker-url')
     source = AlpsStream(url, args.alps_url or env.get('ALPS_BRIDGE_URL'), args.load_cell,
-                        env.get('MOONRAKER_API_KEY'), options, not args.sensor_check)
+                        env.get('MOONRAKER_API_KEY'), options, not args.sensor_check,
+                        status_validator=status_validator)
     try:
         source.start()
+        if options.trigger_source == 'klipper_probe' and not args.sensor_check:
+            if args.load_cell != 'load_cell_probe':
+                raise ValueError('Native probe trigger requires the configured load_cell_probe')
+            from print_control.klipper_probe_trigger import KlipperProbeTrigger
+            trigger = KlipperProbeTrigger(url, env.get('MOONRAKER_API_KEY'),
+                max_delta_counts=options.max_delta_counts,
+                max_nozzle_temp_c=options.max_nozzle_temp_c,
+                **({'thermal_targets':native_thermal_targets} if native_thermal_targets else {}))
+            capability = trigger.validate_ready()
+            scale = capability['counts_per_gram']
+            if scale != source.sensor.get('counts_per_gram'):
+                raise RuntimeError('Native probe and ALPS calibration disagree')
+            # The configured force becomes the primary threshold. The existing
+            # raw overload ceiling remains unchanged and must exceed it.
+            options = replace(options, contact_delta_counts=capability['trigger_force_g']*scale)
+            source.options = options
+            source.native_trigger = trigger
+            source.native_trigger_force_g = capability['trigger_force_g']
         samples = source.wait_window(source.clock())
-        if not args.sensor_check: stable_baseline(samples, source.sensor, options)
+        if not args.sensor_check and check_baseline: stable_baseline(samples, source.sensor, options)
     except Exception:
         source.close()
         raise
@@ -128,12 +147,22 @@ class LoadCellBedProbe(BedProbe):
         super().check_interrupted()
         if self.source is not None:
             samples = self.source.snapshot()
-            if self.detector is not None and self.detector.update(samples) and self.seeking:
-                raise ContactDetected('Nozzle contact detected')
+            # Scan every raw sample for overload even after a native contact.
+            contact = self.detector is not None and self.detector.update(samples)
+            native = getattr(self.source, 'native_trigger', None)
+            if native is not None and self.seeking and not getattr(self, '_z_manual_active', False):
+                contact = native.check()
+            if contact and self.seeking:
+                # Only the bounded precision landing may finish its already
+                # executing tiny segment. No following segment may start after
+                # the trigger. Overload and native faults above still interrupt.
+                finish_step = getattr(self, 'finish_precision_contact_step', None)
+                if finish_step is None or not finish_step():
+                    raise ContactDetected('Nozzle contact detected')
 
     def pump(self):
         self.check_interrupted()
-        if not self.config.dry_run: rclpy.spin_once(self, timeout_sec=.01)
+        if not self.config.dry_run: self.spin_feedback(.01)
 
     def window(self):
         return self.source.wait_window(self.source.clock(), pump=self.pump)
@@ -146,10 +175,19 @@ class LoadCellBedProbe(BedProbe):
             self.reference_counts = baseline
         self.detector = ContactDetector(baseline, sensor.get('counts_per_gram'), self.contact_options)
         self.detector.last_sequence = samples[-1].sequence
+        print('ALPS unloaded reference: %.1f counts; sample range %.1f counts; noise limit %.1f %s' %
+              (baseline, max(s.counts for s in samples)-min(s.counts for s in samples),
+               self.contact_options.baseline_noise_limit,self.contact_options.unit), flush=True)
         return baseline
 
     def cancel_contact(self):
         """Require a terminal action result before any measurement or retraction."""
+        self.confirm_motion_stopped()
+        nozzle, joints = self.nozzle_now()
+        self.target, self.seed = np.asarray(nozzle), joints.copy()
+
+    def confirm_motion_stopped(self):
+        """Prove termination without taking a load measurement or suppressing a fault."""
         self.seeking = False
         if not self.config.dry_run:
             self.stop()
@@ -162,18 +200,21 @@ class LoadCellBedProbe(BedProbe):
                 if (result.status not in (GoalStatus.STATUS_CANCELED, GoalStatus.STATUS_SUCCEEDED) or
                         (result.status == GoalStatus.STATUS_SUCCEEDED and result.result.error_code != 0)):
                     raise RuntimeError('Controller fault during contact stop; point rejected')
-            self.aborting = False
-            self.goal_future = self.goal_handle = self.result_future = self.motion_token = None
-        nozzle, joints = self.nozzle_now()
-        self.target, self.seed = np.asarray(nozzle), joints.copy()
+        self.aborting = False
+        self.goal_future = self.goal_handle = self.result_future = self.motion_token = None
 
     def touch_once(self, *, floor_z=None, speed_mm_s=None, step_mm=None):
         options = self.contact_options
         floor = self.bed_point(self.points[self.index])[2]-self.args.floor_mm if floor_z is None else floor_z
         speed = options.speed_mm_s if speed_mm_s is None else speed_mm_s
         step = options.step_mm if step_mm is None else step_mm
-        self.seeking = True
+        native = getattr(self.source, 'native_trigger', None)
         try:
+            if native is not None:
+                # Stepped precision probing deliberately includes settled sample
+                # windows; use a bounded generous timeout independent of speed.
+                native.begin_contact(self.pump, search_timeout_s=7200.)
+            self.seeking = True
             while True:
                 self.check_interrupted()
                 if self.target[2] <= floor+1e-8:
@@ -183,11 +224,19 @@ class LoadCellBedProbe(BedProbe):
                 self.line_to(end, 'contact step', speed)
                 # Wait for samples collected after this step, never reuse a previous plateau.
                 samples = self.window()
-                if self.detector.update(samples): raise ContactDetected('Nozzle contact detected')
+                contact = self.detector.update(samples)
+                if native is not None: contact = native.check()
+                if contact: raise ContactDetected('Nozzle contact detected')
         except ContactDetected:
             self.cancel_contact()
+            if native is not None: native.confirm_contact(self.pump)
+        except BaseException:
+            if native is not None: self.stop()
+            raise
         finally:
             self.seeking = False
+            if native is not None:
+                native.end_contact()
         samples = self.window()
         self.detector.update(samples)  # The overload guard remains active while stopped.
         load = statistics.median(abs(self.detector.load(s.counts)) for s in samples)
@@ -210,16 +259,35 @@ class LoadCellBedProbe(BedProbe):
         """Repeat, validate and lift before recording a point."""
         self.lift()
         readings = []
+        self._point_readings = readings
+        self._point_reference_z = None
         try:
             for _ in range(self.contact_options.samples):
                 self.set_baseline()
                 readings.append(self.mesh_touch())
+                reading = readings[-1]
+                print('Point %d contact %d/%d: Z %.5f mm; load %.1f %s; %s' %
+                      (self.index+1,len(readings),self.contact_options.samples,
+                       reading['nozzle'][2],reading['load'],self.contact_options.unit,
+                       reading.get('contact_method','stepped_cancel')),flush=True)
+                if self._point_reference_z is None:
+                    self._point_reference_z=float(readings[-1]['nozzle'][2])
                 self.retract_contact()
-            selected, spread = repeat_contact(readings, self.contact_options.repeatability_mm)
+            try:
+                selected, spread = repeat_contact(readings, self.contact_options.repeatability_mm)
+            except ValueError as error:
+                # Both retracts completed, but preserve every measured contact
+                # when the repeatability check rejects the point.
+                recorder=getattr(self,'record_contact_failure',None)
+                self.stop()
+                if recorder is not None:recorder(error)
+                raise
             self.lift()
         except ValueError as error:
             # Failure may follow physical contact: terminate instead of permitting jog keys.
             raise RuntimeError(str(error)) from error
+        finally:
+            self._point_reference_z = None
         nozzle, joints = selected['nozzle'], selected['joints']
         load_key = 'delta_counts' if self.contact_options.trigger_mode == 'raw' else 'force_g'
         self.records[self.index] = {
@@ -227,14 +295,20 @@ class LoadCellBedProbe(BedProbe):
             'gcode_xy': rounded(self.gcode_xy(nozzle)), 'nozzle_base_mm': rounded(nozzle),
             'bed_z_mm': round(float(nozzle[2])+self.contact_options.contact_offset_mm, 4),
             'joints_rad': rounded(joints, 6), 'contact_'+load_key: round(selected['load'], 2),
-            'repeatability_mm': round(spread, 5),
+            'repeatability_mm': None if spread is None else round(spread, 5),
+            'repeatability_checked': spread is not None,
             'contacts': [{'nozzle_base_mm': rounded(r['nozzle']), load_key: round(r['load'], 2),
+                          'contact_method': r.get('contact_method', 'stepped_cancel'),
+                          **({'locator_contact':r['locator_contact']} if 'locator_contact' in r else {}),
                           'peak_'+load_key: round(r['peak_load'], 2), 'tare_counts': r['tare_counts']}
                          for r in readings],
         }
+        policy=getattr(self,'thermal_policy',None)
+        if policy is not None:self.records[self.index]['probing_temperature']=policy.status()
         self.save()
-        print('Point %d: bed Z %.4f mm; repeat spread %.4f mm (%d/%d recorded)' %
-              (self.index+1, self.records[self.index]['bed_z_mm'], spread, len(self.records), len(self.points)))
+        spread_text = 'not measured (single contact)' if spread is None else '%.4f mm' % spread
+        print('Point %d: bed Z %.4f mm; repeat spread %s (%d/%d recorded)' %
+              (self.index+1, self.records[self.index]['bed_z_mm'], spread_text, len(self.records), len(self.points)))
 
     def mesh_touch(self):
         return self.touch_once()

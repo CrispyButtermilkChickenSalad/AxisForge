@@ -13,7 +13,15 @@ Klipper applies its configured pressure advance to positive XY extrusion. It doe
 not run a second virtual-SD copy. The robot worker applies the bed transform and
 TCP once, samples IK and cubic joint interpolation, and rejects any joint velocity,
 acceleration, position, orientation or branch-continuity violation. It preserves
-all master timestamps. Only the initial nonextruding approach may be retimed.
+all master timestamps. The bridge measures both the offset and the MCU print
+clock's rate. Before queueing each run, its master-clock durations are divided by
+that rate and joint velocities multiplied by it, converting the same trajectory
+into the PC's monotonic-clock units. Geometry and extrusion progress do not change.
+Preflight reserves joint speed/acceleration margin for rates within ±1000 ppm;
+larger or invalid rates are rejected. The queued run's mapping stays fixed and
+periodic phase checks still abort on unexpected drift. Raising the alignment
+limit is not required to account for normal MCU oscillator drift. Untimed entry
+and finishing moves use the PC clock directly.
 
 ```mermaid
 sequenceDiagram
@@ -42,16 +50,47 @@ sequenceDiagram
     UI->>R: Complete
 ```
 
+The Bridge measures the Klipper host's RAW clock against the PC's monotonic clock
+in the background, including while idle. This accounts for different host
+oscillators and Linux frequency correction; the printer host's own monotonic
+clock is not assumed to run at the PC's rate. It uses the lowest-RTT sample in
+each two-second bucket over up to 180 seconds, requiring at least 60 seconds of
+recent observations and a stable fit. Isolated midpoint outliers are excluded
+from frequency estimation; every current exchange still constrains phase.
+The resulting host rate is multiplied by
+Klipper's MCU/RAW clock rate before scheduling. A Klipper restart or a connection
+gap invalidates the fit. Preflight/Start waits for calibration before heating or
+moving; normally it has already completed during dashboard setup. No NTP wall
+time, Internet access, or changes to the selected clock limits are needed.
+
 The Bridge maps Klipper `print_time` to local monotonic time using five request/
-response samples, taking the smallest RTT; uncertainty is RTT/2 plus 1 ms and must
-meet the selected scheduling limit (10 ms by default). It refreshes the mapping before each run and checks clock drift
+response samples. Each exchange supplies a send/receive interval with a 1 ms MCU
+allowance; their intersection gives the phase estimate and its uncertainty.
+Contradictory samples fail instead of being averaged into a seemingly good result.
+Uncertainty must meet the selected scheduling limit (10 ms by default).
+It refreshes the mapping before each run and checks clock drift
 every two seconds during execution. A running trajectory keeps its original
 timestamps; an alignment estimate above the selected running limit (10 ms by default)
-aborts both participants. The estimate is the absolute offset change plus the latest
+aborts both participants. The estimate is the absolute phase difference from the
+original rate-corrected mapping plus the latest
 sampling uncertainty; it is not measured physical robot lag. The worker and Bridge
 must run on the same Linux host. A future ROS action stamp is derived from that
 host's ROS/system clock; a >5 ms ROS clock step during motion aborts. UR scaling
 must remain 100%; speed slider changes cause a stop, not independent robot retiming.
+
+`clock_measurement` includes signed `phase_error_ms`, `run_elapsed_s`, the scheduled
+and current rates, and host-rate fit quality. A failed workflow exposes its last
+120 checks as `recent_clock_checks`; the limit-crossing measurement is also logged.
+The fit-quality estimate does not guarantee future
+oscillator stability; the independent phase/uncertainty stop remains active.
+An active run uses its original rate for phase checks even if the background
+frequency fit temporarily becomes noisy. A fresh stable fit is required before
+scheduling the next run; no running timestamps are changed.
+
+If Stop receives the UR controller's explicit instruction to reconnect port 29999,
+the Bridge verifies Remote Control, reconnects through the driver's existing
+Dashboard service, and retries Stop once. Failure remains visible. This does not
+select Remote, unlock safety, power the arm, or start its program.
 
 ### Clock timing profiles
 
@@ -338,6 +377,10 @@ latency is bounded by the controllers/network/watchdogs and must be measured.
   The first nonextruding XY move defines entry; earlier Z/orientation establish
   its pose. A file needs a subsequent motion chunk.
 - SET_PRESSURE_ADVANCE is accepted only if ADVANCE equals the host configuration.
+  A startup `SET_VELOCITY_LIMIT ACCEL=<positive number>` is also accepted before
+  the first XY entry. Its value is capped at the configured synchronization
+  acceleration and applied to the shared schedule; other velocity-limit
+  parameters and mid-print changes are rejected.
   Unknown macros, arcs, unsupported tool changes/parameters and malformed input
   fail before heating. This is intentionally not arbitrary Klipper G-code.
 - Without continuous mode, each source move stops and chunks nominally span
@@ -403,3 +446,17 @@ first install, remove `axisforge_sync.py`, `axisforge_schedule.py` and
 the configuration. Restart idle Klipper and verify ready. The legacy read-only
 exporter can remain installed. Restore source from version control and restart
 services to roll back the dashboard/worker. Do not resume a partially printed job.
+
+## Current validation status — 17 November 2026
+
+Clock alignment remains an open issue. The latest stationary check with concurrent
+status traffic exceeded the unchanged 10 ms guard after approximately 246 seconds
+(10.13 ms reported alignment, including 4.18 ms measurement uncertainty).
+Inter-host rate measurement and clock diagnostics are included, but this is not
+a verified fix for long synchronized prints. A complete print has not been
+validated with these changes. Heaters and robot motion were not commanded by
+that timing test.
+
+Run fresh homing/mesh capture for the actual cell before printing. Saved meshes,
+uploaded jobs, credentials and diagnostic captures from the development machine
+are not included in this update.

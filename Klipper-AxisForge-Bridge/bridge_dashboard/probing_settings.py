@@ -25,18 +25,21 @@ FIELDS = {
     'first_speed_mm_s': ('homing', 'first_speed_mm_s', .5, 10.),
     'second_speed_mm_s': ('homing', 'second_speed_mm_s', .02, 1.),
     'lift_speed_mm_s': ('homing', 'lift_speed_mm_s', 1., 20.),
+    'max_descent_mm': ('homing', 'max_descent_mm', 5., 350.),
     'mesh_columns': ('homing', 'mesh_columns', 2, 9),
     'mesh_rows': ('homing', 'mesh_rows', 2, 9),
-    'mesh_speed_mm_s': ('contact', 'speed_mm_s', .02, .2),
-    'mesh_samples': ('contact', 'samples', 3, 5),
+    'mesh_yaw_deg': ('homing', 'mesh_yaw_deg', -180., 180.),
+    'mesh_speed_mm_s': ('contact', 'speed_mm_s', .02, .5),
+    'mesh_samples': ('contact', 'samples', 1, 5),
     'mesh_repeatability_mm': ('contact', 'repeatability_mm', .005, .05),
 }
 INTEGER_FIELDS = {'mesh_samples', 'mesh_columns', 'mesh_rows'}
+DEFAULTS = {'mesh_yaw_deg': 0.}
 
 
 def validate(values):
     if not isinstance(values, dict) or set(values) != set(FIELDS):
-        raise ProbingSettingsError('Supply all eight probing settings and no other parameters')
+        raise ProbingSettingsError('Supply all probing settings and no other parameters; reload the setup form')
     result = {}
     for name, (_, _, minimum, maximum) in FIELDS.items():
         value = values[name]
@@ -77,16 +80,26 @@ def parse(raw):
                 if section == 'contact' and name == 'trigger_mode':
                     if value not in ('raw', 'grams'):
                         raise ProbingSettingsError('Invalid contact trigger mode')
+                elif section == 'contact' and name == 'trigger_source':
+                    if value not in ('stream', 'klipper_probe'):
+                        raise ProbingSettingsError('Invalid contact trigger source')
                 elif type(value) not in (int, float) or not math.isfinite(value):
                     raise ProbingSettingsError('Probing profile values must be finite numbers')
+        if (data['contact'].get('trigger_source') == 'klipper_probe' and
+                data['contact'].get('trigger_mode') != 'raw'):
+            raise ProbingSettingsError('Native probing requires raw overload guard units')
         for trigger, maximum in (('contact_delta_counts', 'max_delta_counts'),
                                  ('contact_force_g', 'max_force_g')):
             contact = data['contact']
             if trigger in contact and maximum in contact and not 0 < contact[trigger] < contact[maximum]:
                 raise ProbingSettingsError('Contact trigger must be positive and lower than its stop threshold')
-        values = validate({name: data[section][key] for name, (section, key, _, _) in FIELDS.items()})
+        values = validate({name: data[section].get(key, DEFAULTS.get(name)) for name, (section, key, _, _) in FIELDS.items()})
+        retract = data['homing'].get('retract_mm', 3.)
+        if not 1 <= retract <= 5 or values['max_descent_mm'] <= retract:
+            raise ProbingSettingsError('Maximum Z search must exceed the configured 1..5 mm homing retract')
         editable = {}
         for name, (section, key, _, _) in FIELDS.items():
+            if key not in nodes[section] and name in DEFAULTS:continue
             node = nodes[section][key]
             if not isinstance(node, yaml.ScalarNode):
                 raise ProbingSettingsError('Editable probing settings must be explicit numeric scalars')
@@ -156,11 +169,21 @@ class ProbingSettings:
                 return dict(self.status(), changed=False, message='Probing settings are unchanged.')
             expected = copy.deepcopy(data)
             for name, (section, key, _, _) in FIELDS.items():
-                expected[section][key] = values[name]
+                if name in nodes or values[name] != DEFAULTS.get(name):
+                    expected[section][key] = values[name]
             candidate = text
             for name, node in sorted(nodes.items(), key=lambda item: item[1].start_mark.index, reverse=True):
                 candidate = (candidate[:node.start_mark.index] + json.dumps(values[name], allow_nan=False) +
                              candidate[node.end_mark.index:])
+            for name in DEFAULTS:
+                if name in nodes or values[name] == DEFAULTS[name]:continue
+                section,key,_,_=FIELDS[name]
+                mapping=_mapping(yaml.compose(candidate))[section]
+                if mapping.flow_style:
+                    raise ProbingSettingsError('Convert the homing section to block YAML before adding bed direction')
+                start=mapping.start_mark
+                candidate=(candidate[:start.index]+key+': '+json.dumps(values[name])+'\n'+' '*start.column+
+                           candidate[start.index:])
             if yaml.safe_load(candidate) != expected:
                 raise ProbingSettingsError('Cannot save probing values without changing other settings')
             parse(candidate.encode('utf-8'))

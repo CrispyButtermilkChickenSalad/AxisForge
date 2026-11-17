@@ -2,7 +2,9 @@
 
 import asyncio
 import contextlib
+import logging
 import time
+from collections import deque
 
 from bridge_dashboard.gcode_check import sha256_file
 from bridge_dashboard.sync_clients import PROTOCOL, ParticipantError, ParticipantTransportError, sample_clock
@@ -12,6 +14,7 @@ from klipper_extras.axisforge_corners import options as corner_options
 HEARTBEAT_REPLY_S = .5
 COLD_REPLY_WINDOW_S = 2.
 COLD_LEASE_S = 3.
+logger = logging.getLogger(__name__)
 
 
 class Workflow:
@@ -45,7 +48,9 @@ class Workflow:
         self.motion_options = None
         self.clock_options = clock_options()
         self.clock_measurement = None
+        self.clock_history = deque(maxlen=120)
         self.clock_speed_guidance = None
+        self.tracking = None
 
     def status(self):
         return {'state':self.state,'message':self.message,'job':self.job,
@@ -60,6 +65,8 @@ class Workflow:
                     age_s=max(0.,self.clock()-self.clock_measurement['sampled_at']))
                     if self.clock_measurement else None),
                 'clock_speed_guidance':self.clock_speed_guidance,
+                'recent_clock_checks':list(self.clock_history) if self.state=='failed' else [],
+                'tracking':self.tracking,
                 'heartbeat':dict(self.heartbeat_stats, active=self.master_leased,
                     lease_mode=self.master_lease_mode,
                     last_success_age_s=(max(0.,self.clock()-self.heartbeat_stats['last_success_at'])
@@ -328,6 +335,8 @@ class Workflow:
             self.motion_options = selected
             self.clock_options = timing
             self.clock_measurement = self.clock_speed_guidance = None
+            self.clock_history.clear()
+            self.tracking = None
             self.job,self.state,self.stage,self.progress,self.message = job,'preflighting','host',0.,'Checking Klipper'
             self.checks, self.temperature = [], {}
             self.task = asyncio.create_task(self._preflight(job,sha256_file(path)))
@@ -345,6 +354,9 @@ class Workflow:
                 raise ParticipantError('Robot is owned by bed probing or another AxisForge controller')
             if robot_caps.get('clock_options_supported') is not True:
                 raise ParticipantError('Update the AxisForge worker to support clock timing options')
+            if not master_caps.get('clock_rate_supported') or not robot_caps.get('clock_rate_supported'):
+                raise ParticipantError('Update Klipper and the AxisForge worker for print clock-rate conversion')
+            await self._wait_clock_ready()
             extra={'motion_options':self.motion_options} if self.motion_options is not None else {}
             prepared = await self.master.call('prepare',job=job,sha256=sha,
                                                heater_checks=dict(self.heater_checks),**extra)
@@ -437,6 +449,15 @@ class Workflow:
             await self._renew_master_heartbeat()
             await self._sample_clock()
             self._check('robot','Timed trajectory','IK, interpolation and joint limits passed without retiming')
+            reference = robot.get('z_reference')
+            if reference:
+                self._check('robot','Print Z reference',
+                    '%s; Z adjustment %+.3f mm' % (reference['formula'], reference['adjustment_mm']))
+            if robot.get('finish_required'):
+                self._check('robot','Move after printing',
+                    ('Checked %g mm vertical lift from the final print point; holds XY and orientation' %
+                     robot['finish_move']['distance_mm']) if robot['finish_move']['kind'] == 'lift' else
+                    'Checked return to the corrected bed-homing pose; only after successful printing')
             self.record = {'job':job,'sha256':sha,'checked_at':self.clock(),
                            'heater_checks':dict(self.heater_checks),
                            'motion_options':dict(self.motion_options),
@@ -488,6 +509,7 @@ class Workflow:
 
     async def _run(self):
         try:
+            await self._wait_clock_ready()
             acquired = await self.master.call('acquire',session=self.session,run=True)
             self.master_leased = True
             self._validate_master_ack(acquired,'strict')
@@ -530,6 +552,7 @@ class Workflow:
                     start = mapping.local_time(reservation['start_print_time'])
                     accepted = await self.robot.call('schedule',session=self.session,index=op['index'],
                         start_monotonic=start,clock_uncertainty_s=mapping.uncertainty,
+                        print_time_rate=mapping.rate,
                         clock_options=dict(self.clock_options))
                     if not accepted.get('accepted'): raise ParticipantError('Robot did not accept the timed chunk')
                     await self.master.call('commit',session=self.session,token=reservation['token'])
@@ -544,6 +567,7 @@ class Workflow:
                             await self._check_running_clock(mapping)
                             last_clock_check = self.clock()
                         robot,master = await asyncio.gather(self.robot.call('status'),self.master.call('status'))
+                        self.tracking = robot.get('tracking')
                         for status in (robot,master):
                             if status['state']=='fault': raise ParticipantError(status['error'])
                         fraction = min(1.,max(0.,(master['clock']['print_time']-
@@ -553,12 +577,28 @@ class Workflow:
                                 and master['clock']['print_time']>=reservation['end_print_time'])
                     await self._wait(chunk_done,op['duration_s']+10.,'Synchronized chunk')
                     await self.master.call('ack',session=self.session,token=reservation['token'])
+            robot = await self.robot.call('status')
+            finished_move = None
+            if robot.get('finish_required'):
+                finished_move = robot['finish_move']
+                description = ('lifting %g mm vertically from the final print point' % finished_move['distance_mm']
+                               if finished_move['kind'] == 'lift' else 'returning to the saved bed-homing pose')
+                self.stage,self.message = 'finish_print','Print finished; '+description
+                await self.master.call('heaters_off',session=self.session)
+                await self.robot.call('finish_print',session=self.session)
+                async def finish_done():
+                    status = await self.robot.call('status')
+                    if status['state']=='fault': raise ParticipantError(status['error'])
+                    return status['state']=='at_boundary' and status.get('finish_completed')
+                await self._wait(finish_done,300.,'Post-print move')
             await self._end_heartbeat()
             await self.robot.call('complete',session=self.session)
             self.robot_leased = False
             await self.master.call('complete',session=self.session)
             self.master_leased = False
-            self.state,self.stage,self.progress,self.message = 'complete','complete',1.,'Both systems completed; heaters are off'
+            self.state,self.stage,self.progress,self.message = 'complete','complete',1.,(('Print complete; nozzle lifted %g mm above the final print point; heaters are off' % finished_move['distance_mm']
+                if finished_move['kind'] == 'lift' else 'Print complete; arm returned to the saved bed-homing pose; heaters are off')
+                if finished_move else 'Both systems completed; heaters are off')
         except asyncio.CancelledError:
             await self._stop_participants(self.heartbeat_error or 'Operator abort')
             self.state,self.message = 'failed' if self.heartbeat_error else 'aborted',self.heartbeat_error or 'Job aborted'
@@ -569,21 +609,46 @@ class Workflow:
             self.record = None  # Every run needs fresh preflight and a new session.
             await self._end_heartbeat()
 
-    async def _sample_clock(self):
+    async def _wait_clock_ready(self):
+        wait = getattr(self.master, 'wait_clock_ready', None)
+        if wait is not None:
+            self.stage, self.message = 'clock', 'Measuring the clock rate between both hosts; allow about 60 seconds after connection'
+            await wait()
+
+    async def _sample_clock(self, reference=None):
         current = await self.clock_sampler(self.master,
-            max_uncertainty_s=self.clock_options['max_uncertainty_ms']/1000)
+            max_uncertainty_s=self.clock_options['max_uncertainty_ms']/1000,
+            **({'reference':reference} if reference is not None else {}))
         self.clock_measurement = {'uncertainty_ms':current.uncertainty*1000,
-            'alignment_error_ms':None, 'sampled_at':current.sampled_at}
+            'alignment_error_ms':None, 'sampled_at':current.sampled_at,
+            'print_clock_rate_ppm':(current.rate-1.)*1e6}
+        if current.host_rate is not None:
+            self.clock_measurement.update(host_clock_rate_ppm=(current.host_rate.rate-1.)*1e6,
+                host_rate_span_s=current.host_rate.span_s,
+                host_rate_fit_error_ppm=current.host_rate.error_ppm,
+                rate_source='measured_between_hosts')
+        if current.rate_diagnostic:
+            self.clock_measurement['rate_diagnostic'] = current.rate_diagnostic
         return current
 
     async def _check_running_clock(self, mapping):
-        current = await self._sample_clock()
+        current = await self._sample_clock(reference=mapping)
         if self.clock()-current.sampled_at > 5.:
             raise ParticipantError('Clock mapping is stale during synchronized motion')
-        error = abs(current.offset-mapping.offset)+current.uncertainty
+        if mapping.epoch != current.epoch:
+            raise ParticipantError('Klipper clock restarted during synchronized motion')
+        phase = (current.offset-mapping.offset_at(current.sampled_at))/mapping.rate
+        error = abs(phase)+current.uncertainty
         self.clock_measurement['alignment_error_ms'] = error*1000
+        self.clock_measurement['phase_error_ms'] = phase*1000
+        self.clock_measurement['run_elapsed_s'] = current.sampled_at-mapping.sampled_at
+        self.clock_measurement['scheduled_clock_rate_ppm'] = (mapping.rate-1.)*1e6
+        self.clock_history.append(dict(self.clock_measurement))
+        logger.info('Sync clock session=%s measurement=%s', self.session, self.clock_measurement)
         limit = self.clock_options['max_alignment_error_ms']
         if error > limit/1000:
+            logger.warning('Sync clock limit exceeded: session=%s measurement=%s',
+                           self.session, self.clock_measurement)
             raise ParticipantError('Clock alignment error %.2f ms exceeds %g ms during motion' % (error*1000,limit))
 
     async def abort(self, reason='Operator abort'):

@@ -8,7 +8,7 @@ import unittest
 
 from print_control.load_cell_contact import (
     AlpsStream, ContactDetector, ContactOptions, ForceSample, repeat_contact,
-    stable_baseline, validate_printer,
+    stable_baseline, validate_printer, thermal_contact_options,
 )
 
 
@@ -26,6 +26,50 @@ def samples(forces, start=1):
 
 class ContactTests(unittest.TestCase):
     def setUp(self): self.options = ContactOptions()
+
+    def test_hot_baseline_accepts_bounded_noise_without_changing_contact_or_overload(self):
+        cold=ContactOptions(trigger_mode='raw')
+        hot=thermal_contact_options(cold,hot_nozzle=True)
+        def raw(values):return [ForceSample(i,i*.002,i*.002,float(value)) for i,value in enumerate(values,1)]
+        noisy=raw([-3500.,3500.]*20)
+        with self.assertRaisesRegex(ValueError,'too noisy'):stable_baseline(noisy,{},cold)
+        self.assertEqual(stable_baseline(noisy,{},hot),0.)
+        self.assertEqual(hot.baseline_noise_limit,8000.)
+        self.assertEqual(thermal_contact_options(hot,hot_nozzle=False),cold)
+        self.assertEqual((hot.threshold,hot.maximum),(cold.threshold,cold.maximum))
+        detector=ContactDetector(0.,None,hot)
+        self.assertTrue(detector.update(raw([20000.]*5)))
+        with self.assertRaisesRegex(RuntimeError,'overload'):
+            ContactDetector(0.,None,hot).update(raw([120000.]))
+        for values,reason in (([-4500.,4500.]*20,'too noisy'),
+                              (list(range(-3500,3501,100)),'drifting'),
+                              ([0.]*19+[6000.],'asymmetric'),
+                              ([25000.-3500.,25000.+3500.]*20,'already be loaded')):
+            with self.subTest(reason=reason),self.assertRaisesRegex(ValueError,reason):
+                stable_baseline(raw(values),{},hot,reference_counts=0.)
+        for fraction in (.24,.401):
+            with self.assertRaises(ValueError):replace(cold,baseline_noise_fraction=fraction)
+
+    def test_raw_search_guard_stops_at_one_hundred_twenty_thousand(self):
+        for sign in (-1, 1):
+            detector = ContactDetector(-200000., None, ContactOptions(trigger_mode='raw'))
+            detector.update([ForceSample(1, .002, .002, -200000.+sign*80000.)])
+            detector.update([ForceSample(2, .004, .004, -200000.+sign*119999.)])
+            with self.assertRaisesRegex(RuntimeError, 'overload: 120000.0 counts exceeds 120000.0 counts'):
+                detector.update([ForceSample(3, .006, .006, -200000.+sign*120000.)])
+
+    def test_native_trigger_requires_real_calibration_even_with_raw_guards(self):
+        options = ContactOptions(trigger_mode='raw', trigger_source='klipper_probe')
+        data = status()
+        validate_printer(data, 'load_cell_probe', options)
+        for change in ({'is_calibrated': False}, {'reference_tare_counts': None}):
+            data['load_cell_probe'].update(change)
+            with self.assertRaisesRegex(RuntimeError, 'not calibrated'):
+                validate_printer(data, 'load_cell_probe', options)
+
+    def test_native_trigger_rejects_unknown_sources_and_ambiguous_guard_units(self):
+        for change in ({'trigger_source': 'query_probe'}, {'trigger_source': 'klipper_probe'}):
+            with self.assertRaises(ValueError): ContactOptions(**change)
 
     def test_uncalibrated_or_invalid_scale_never_allows_probing(self):
         for change in ({'is_calibrated': False}, {'reference_tare_counts': None},
@@ -76,10 +120,18 @@ class ContactTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'repeatability'): repeat_contact(readings, .02)
 
     def test_invalid_contact_settings_are_rejected(self):
-        for change in ({'step_mm': .1}, {'speed_mm_s': .6}, {'max_force_g': 40}, {'samples': 1},
+        for change in ({'step_mm': .1}, {'speed_mm_s': .6}, {'max_force_g': 40}, {'samples': 0},
                        {'samples': True}, {'retract_mm': .02}, {'max_sample_age_s': 2},
                        {'contact_force_g': float('nan')}, {'consecutive_samples': 1}):
             with self.subTest(change=change), self.assertRaises(ValueError): ContactOptions(**change)
+
+    def test_single_contact_returns_height_without_claiming_repeatability(self):
+        self.assertEqual(ContactOptions(samples=1).samples, 1)
+        reading = {'nozzle': [0., 0., 100.]}
+        chosen, spread = repeat_contact([reading], .02)
+        self.assertIs(chosen, reading)
+        self.assertIsNone(spread)
+        with self.assertRaises(ValueError): repeat_contact([], .02)
 
 
 class StreamTests(unittest.TestCase):
@@ -116,6 +168,32 @@ class StreamTests(unittest.TestCase):
             self.setUp(); self.source.ingest(self.batch()); self.now += elapsed
             with self.subTest(elapsed=elapsed), self.assertRaisesRegex(RuntimeError, 'clock changed'):
                 self.source.ingest(self.batch(stamp))
+
+    def test_delivery_catchup_rebases_the_whole_interval_without_reversing_time(self):
+        self.source.ingest(self.batch())
+        before=self.source.snapshot()
+        # Source advances by 100 ms; its next packet arrives 3 ms sooner.
+        # Per-batch anchoring used to put the next sample before the last one.
+        self.now += .097
+        self.source.ingest(self.batch(100.1))
+        samples=self.source.snapshot()
+        self.assertTrue(all(b.observed_at>=a.observed_at for a,b in zip(samples,samples[1:])))
+        self.assertTrue(all(new.observed_at<=old.observed_at for old,new in zip(before,samples)))
+        self.assertEqual([s.counts for s in samples[:50]],[s.counts for s in before])
+        self.assertEqual([s.source_time for s in samples[:50]],[s.source_time for s in before])
+        for sample in samples:
+            self.assertAlmostEqual(sample.observed_at,sample.source_time+self.source.min_offset)
+
+    def test_transport_delay_is_kept_in_sample_age_instead_of_reanchoring_as_fresh(self):
+        self.source.ingest(self.batch())
+        self.now += .125
+        self.source.ingest(self.batch(100.1))
+        self.assertAlmostEqual(self.now-self.source.snapshot()[-1].observed_at,.025)
+        self.now += .075
+        self.source.ingest(self.batch(100.2))
+        samples=self.source.snapshot()
+        self.assertTrue(all(b.observed_at>=a.observed_at for a,b in zip(samples,samples[1:])))
+        self.assertTrue(all(s.observed_at<=self.now for s in samples))
 
     def test_invalid_stream_data(self):
         for bad in ({'error': 'ADC disconnected'}, {'errors': 1}, [], {'rows': [], 'now': 100},
